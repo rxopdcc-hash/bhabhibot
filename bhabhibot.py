@@ -6,7 +6,7 @@ from datetime import timedelta
 
 TOKEN = os.getenv("TOKEN")
 PREFIX = "."
-DATA_FILE = "triggers.json"
+DATA_FILE = "/app/data/triggers.json"
 
 DEFAULT_COLOR = 0x2B2D42
 ERROR_COLOR = 0xFEE75C
