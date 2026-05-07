@@ -24,7 +24,9 @@ DEFAULT_VANITY = {
     "channel_id": None,
     "triggers": [],
     "message": "{user} is repping the server now.",
-    "color": "2B2D42"
+    "color": "57F287",
+    "remove_color": "ED4245",
+    "remove_message": "{user} is no longer repping the server."
 }
 
 DEFAULT_TRIGGERS = {
@@ -549,6 +551,46 @@ async def color(ctx, color=None):
 
 
 @vanity.command()
+async def removecolor(ctx, color=None):
+    if not color:
+        return await ctx.reply(
+            embed=warning_embed(ctx, "Provide a hex color."),
+            mention_author=False
+        )
+
+    gid = setup_guild(ctx.guild.id)
+
+    color = color.replace("#", "")
+
+    TRIGGERS[gid]["vanity"]["remove_color"] = color
+    save_data()
+
+    await ctx.reply(
+        embed=premium_embed(ctx, "remove color updated", f"Remove color set to `{color}`."),
+        mention_author=False
+    )
+
+
+@vanity.command()
+async def removemessage(ctx, *, message=None):
+    if not message:
+        return await ctx.reply(
+            embed=warning_embed(ctx, "Provide a message."),
+            mention_author=False
+        )
+
+    gid = setup_guild(ctx.guild.id)
+
+    TRIGGERS[gid]["vanity"]["remove_message"] = message
+    save_data()
+
+    await ctx.reply(
+        embed=premium_embed(ctx, "remove message updated", "Vanity remove message updated."),
+        mention_author=False
+    )
+
+
+@vanity.command()
 async def list(ctx):
     gid = setup_guild(ctx.guild.id)
 
@@ -758,7 +800,7 @@ async def vanity_bio_check():
 
                         embed = discord.Embed(
                             description=msg,
-                            color=int(vanity["color"], 16)
+                            color=int(vanity["remove_color"], 16)
                         )
 
                         await channel.send(embed=embed)
@@ -769,7 +811,7 @@ async def vanity_bio_check():
 
                     if channel:
                         embed = discord.Embed(
-                            description=f"{member.mention} is no longer repping the server.",
+                            description=vanity["remove_message"].replace("{user}", member.mention),
                             color=0x2B2D42
                         )
 
