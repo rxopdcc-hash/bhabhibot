@@ -736,8 +736,8 @@ async def on_presence_update(before, after):
 
             if channel:
                 embed = discord.Embed(
-                    description=f"{after.mention} is no longer repping the server.",
-                    color=0x2B2D42
+                    description=vanity["remove_message"].replace("{user}", after.mention),
+                    color=int(vanity["remove_color"], 16)
                 )
 
                 await channel.send(embed=embed)
