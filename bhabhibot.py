@@ -745,7 +745,7 @@ async def on_presence_update(before, after):
         except:
             pass
 
-@tasks.loop(seconds=1)
+@tasks.loop(seconds=3)
 async def vanity_bio_check():
     await bot.wait_until_ready()
 
@@ -812,7 +812,7 @@ async def vanity_bio_check():
                     if channel:
                         embed = discord.Embed(
                             description=vanity["remove_message"].replace("{user}", member.mention),
-                            color=0x2B2D42
+                            color=int(vanity["remove_color"], 16)
                         )
 
                         await channel.send(embed=embed)
