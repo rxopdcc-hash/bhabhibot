@@ -14,8 +14,18 @@ ERROR_COLOR = 0xFEE75C
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+intents.presences = True
 
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
+
+DEFAULT_VANITY = {
+    "enabled": False,
+    "role_id": None,
+    "channel_id": None,
+    "triggers": [],
+    "message": "{user} is repping the server now.",
+    "color": "2B2D42"
+}
 
 DEFAULT_TRIGGERS = {
     "ban": [],
@@ -51,7 +61,13 @@ def setup_guild(guild_id):
     gid = str(guild_id)
 
     if gid not in TRIGGERS:
-        TRIGGERS[gid] = {"ban": [], "kick": [], "mute": []}
+        TRIGGERS[gid] = {
+            "ban": [],
+            "kick": [],
+            "mute": [],
+            "vanity": DEFAULT_VANITY.copy()
+        }
+
         save_data()
 
     TRIGGERS[gid].pop("timeout", None)
@@ -59,8 +75,9 @@ def setup_guild(guild_id):
     for key in DEFAULT_TRIGGERS:
         TRIGGERS[gid].setdefault(key, [])
 
-    return gid
+    TRIGGERS[gid].setdefault("vanity", DEFAULT_VANITY.copy())
 
+    return gid
 
 def premium_embed(ctx, title=None, desc=None, syntax=None, example=None):
     e = discord.Embed(color=DEFAULT_COLOR)
@@ -359,6 +376,198 @@ async def trigger(ctx, action=None, command=None, name=None):
 
     return await ctx.reply(embed=warning_embed(ctx, "Use `add`, `clean`, or `list`."), mention_author=False)
 
+@bot.group(invoke_without_command=True)
+async def vanity(ctx):
+    await ctx.reply(
+        embed=premium_embed(
+            ctx,
+            "vanity",
+            ".vanity setup system",
+            ".vanity <subcommand>",
+            ".vanity add bhabhi"
+        ),
+        mention_author=False
+    )
+
+
+@vanity.command()
+async def enable(ctx):
+    gid = setup_guild(ctx.guild.id)
+
+    TRIGGERS[gid]["vanity"]["enabled"] = True
+    save_data()
+
+    await ctx.reply(
+        embed=premium_embed(ctx, "vanity enabled", "Vanity system is now enabled."),
+        mention_author=False
+    )
+
+
+@vanity.command()
+async def disable(ctx):
+    gid = setup_guild(ctx.guild.id)
+
+    TRIGGERS[gid]["vanity"]["enabled"] = False
+    save_data()
+
+    await ctx.reply(
+        embed=premium_embed(ctx, "vanity disabled", "Vanity system is now disabled."),
+        mention_author=False
+    )
+
+
+@vanity.command()
+async def role(ctx, role: discord.Role = None):
+    if role is None:
+        return await ctx.reply(
+            embed=warning_embed(ctx, "Provide a role."),
+            mention_author=False
+        )
+
+    gid = setup_guild(ctx.guild.id)
+
+    TRIGGERS[gid]["vanity"]["role_id"] = role.id
+    save_data()
+
+    await ctx.reply(
+        embed=premium_embed(ctx, "role updated", f"Vanity role set to {role.mention}."),
+        mention_author=False
+    )
+
+
+@vanity.command()
+async def channel(ctx, channel: discord.TextChannel = None):
+    if channel is None:
+        return await ctx.reply(
+            embed=warning_embed(ctx, "Provide a channel."),
+            mention_author=False
+        )
+
+    gid = setup_guild(ctx.guild.id)
+
+    TRIGGERS[gid]["vanity"]["channel_id"] = channel.id
+    save_data()
+
+    await ctx.reply(
+        embed=premium_embed(ctx, "channel updated", f"Vanity channel set to {channel.mention}."),
+        mention_author=False
+    )
+
+
+@vanity.command()
+async def add(ctx, *, trigger=None):
+    if not trigger:
+        return await ctx.reply(
+            embed=warning_embed(ctx, "Provide a trigger."),
+            mention_author=False
+        )
+
+    gid = setup_guild(ctx.guild.id)
+
+    trigger = trigger.lower()
+
+    if trigger in TRIGGERS[gid]["vanity"]["triggers"]:
+        return await ctx.reply(
+            embed=warning_embed(ctx, "That trigger already exists."),
+            mention_author=False
+        )
+
+    TRIGGERS[gid]["vanity"]["triggers"].append(trigger)
+    save_data()
+
+    await ctx.reply(
+        embed=premium_embed(ctx, "trigger added", f"`{trigger}` added."),
+        mention_author=False
+    )
+
+
+@vanity.command()
+async def remove(ctx, *, trigger=None):
+    if not trigger:
+        return await ctx.reply(
+            embed=warning_embed(ctx, "Provide a trigger."),
+            mention_author=False
+        )
+
+    gid = setup_guild(ctx.guild.id)
+
+    trigger = trigger.lower()
+
+    if trigger not in TRIGGERS[gid]["vanity"]["triggers"]:
+        return await ctx.reply(
+            embed=warning_embed(ctx, "Trigger not found."),
+            mention_author=False
+        )
+
+    TRIGGERS[gid]["vanity"]["triggers"].remove(trigger)
+    save_data()
+
+    await ctx.reply(
+        embed=premium_embed(ctx, "trigger removed", f"`{trigger}` removed."),
+        mention_author=False
+    )
+
+
+@vanity.command()
+async def message(ctx, *, message=None):
+    if not message:
+        return await ctx.reply(
+            embed=warning_embed(ctx, "Provide a message."),
+            mention_author=False
+        )
+
+    gid = setup_guild(ctx.guild.id)
+
+    TRIGGERS[gid]["vanity"]["message"] = message
+    save_data()
+
+    await ctx.reply(
+        embed=premium_embed(ctx, "message updated", "Vanity message updated."),
+        mention_author=False
+    )
+
+
+@vanity.command()
+async def color(ctx, color=None):
+    if not color:
+        return await ctx.reply(
+            embed=warning_embed(ctx, "Provide a hex color."),
+            mention_author=False
+        )
+
+    gid = setup_guild(ctx.guild.id)
+
+    color = color.replace("#", "")
+
+    TRIGGERS[gid]["vanity"]["color"] = color
+    save_data()
+
+    await ctx.reply(
+        embed=premium_embed(ctx, "color updated", f"Color set to `{color}`."),
+        mention_author=False
+    )
+
+
+@vanity.command()
+async def list(ctx):
+    gid = setup_guild(ctx.guild.id)
+
+    vanity = TRIGGERS[gid]["vanity"]
+
+    triggers = vanity["triggers"]
+
+    formatted = " ".join(f"`{t}`" for t in triggers) if triggers else "`none`"
+
+    text = (
+        f"**enabled**: `{vanity['enabled']}`\n"
+        f"**triggers**: {formatted}"
+    )
+
+    await ctx.reply(
+        embed=premium_embed(ctx, "vanity config", text),
+        mention_author=False
+    )
+
 
 @bot.event
 async def on_message(message):
@@ -413,6 +622,86 @@ async def on_command_error(ctx, error):
         return await ctx.reply(embed=warning_embed(ctx, "Invalid argument."), mention_author=False)
 
     raise error
+
+@bot.event
+async def on_presence_update(before, after):
+    if after.bot or not after.guild:
+        return
+
+    gid = setup_guild(after.guild.id)
+
+    vanity = TRIGGERS[gid]["vanity"]
+
+    if not vanity["enabled"]:
+        return
+
+    role_id = vanity["role_id"]
+    channel_id = vanity["channel_id"]
+
+    if not role_id:
+        return
+
+    role = after.guild.get_role(role_id)
+
+    if not role:
+        return
+
+    triggers = vanity["triggers"]
+
+    if not triggers:
+        return
+
+    status_text = ""
+
+    for activity in after.activities:
+        if isinstance(activity, discord.CustomActivity):
+            if activity.name:
+                status_text += f" {activity.name.lower()}"
+
+            if activity.state:
+                status_text += f" {activity.state.lower()}"
+
+    matched = any(trigger in status_text for trigger in triggers)
+
+    has_role = role in after.roles
+
+    channel = after.guild.get_channel(channel_id) if channel_id else None
+
+    if matched and not has_role:
+        try:
+            await after.add_roles(role, reason="Vanity detected")
+
+            if channel:
+                msg = vanity["message"]
+
+                msg = msg.replace("{user}", after.mention)
+                msg = msg.replace("{server}", after.guild.name)
+                msg = msg.replace("{role}", role.mention)
+
+                embed = discord.Embed(
+                    description=msg,
+                    color=int(vanity["color"], 16)
+                )
+
+                await channel.send(embed=embed)
+
+        except:
+            pass
+
+    elif not matched and has_role:
+        try:
+            await after.remove_roles(role, reason="Vanity removed")
+
+            if channel:
+                embed = discord.Embed(
+                    description=f"{after.mention} is no longer repping the server.",
+                    color=0x2B2D42
+                )
+
+                await channel.send(embed=embed)
+
+        except:
+            pass
 
 
 @bot.event
