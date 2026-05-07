@@ -1,5 +1,5 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import json
 import os
 from datetime import timedelta
@@ -703,9 +703,87 @@ async def on_presence_update(before, after):
         except:
             pass
 
+@tasks.loop(seconds=1)
+async def vanity_bio_check():
+    await bot.wait_until_ready()
+
+    for guild in bot.guilds:
+        gid = setup_guild(guild.id)
+
+        vanity = TRIGGERS[gid]["vanity"]
+
+        if not vanity["enabled"]:
+            continue
+
+        role_id = vanity["role_id"]
+
+        if not role_id:
+            continue
+
+        role = guild.get_role(role_id)
+
+        if not role:
+            continue
+
+        triggers = vanity["triggers"]
+
+        if not triggers:
+            continue
+
+        channel = guild.get_channel(vanity["channel_id"]) if vanity["channel_id"] else None
+
+        for member in guild.members:
+            if member.bot:
+                continue
+
+            try:
+                fetched = await bot.fetch_user(member.id)
+
+                bio = (fetched.bio or "").lower()
+
+                matched = any(trigger.lower() in bio for trigger in triggers)
+
+                has_role = role in member.roles
+
+                # GIVE ROLE
+                if matched and not has_role:
+                    await member.add_roles(role, reason="Vanity bio detected")
+
+                    if channel:
+                        msg = vanity["message"]
+
+                        msg = msg.replace("{user}", member.mention)
+                        msg = msg.replace("{server}", guild.name)
+                        msg = msg.replace("{role}", role.mention)
+
+                        embed = discord.Embed(
+                            description=msg,
+                            color=int(vanity["color"], 16)
+                        )
+
+                        await channel.send(embed=embed)
+
+                # REMOVE ROLE
+                elif not matched and has_role:
+                    await member.remove_roles(role, reason="Vanity bio removed")
+
+                    if channel:
+                        embed = discord.Embed(
+                            description=f"{member.mention} is no longer repping the server.",
+                            color=0x2B2D42
+                        )
+
+                        await channel.send(embed=embed)
+
+            except:
+                pass
+
 
 @bot.event
 async def on_ready():
+    if not vanity_bio_check.is_running():
+        vanity_bio_check.start()
+
     print(f"Logged in as {bot.user}")
 
 
