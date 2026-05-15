@@ -4,6 +4,11 @@ import ctypes.util
 import glob
 import json
 import os
+import re
+import shutil
+import threading
+import wave
+import zipfile
 from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -370,6 +375,65 @@ def recording_dir():
     return path
 
 
+class MultiUserWaveSink(voice_recv.AudioSink if voice_recv is not None else object):
+    channels = 2
+    sample_width = 2
+    sample_rate = 48000
+
+    def __init__(self, folder):
+        if voice_recv is not None:
+            super().__init__()
+        self.folder = Path(folder)
+        self.folder.mkdir(parents=True, exist_ok=True)
+        self.files = {}
+        self.lock = threading.Lock()
+
+    def wants_opus(self):
+        return False
+
+    def safe_name(self, user):
+        raw = str(user) if user else "unknown"
+        clean = re.sub(r"[^a-zA-Z0-9_.-]+", "_", raw).strip("_")
+        return clean[:60] or "unknown"
+
+    def get_writer(self, user):
+        user_id = user.id if user else "unknown"
+
+        if user_id not in self.files:
+            file_path = self.folder / f"{self.safe_name(user)}-{user_id}.wav"
+            writer = wave.open(str(file_path), "wb")
+            writer.setnchannels(self.channels)
+            writer.setsampwidth(self.sample_width)
+            writer.setframerate(self.sample_rate)
+            self.files[user_id] = {"writer": writer, "path": file_path, "bytes": 0}
+
+        return self.files[user_id]
+
+    def write(self, user, data):
+        if not data.pcm:
+            return
+
+        with self.lock:
+            item = self.get_writer(user)
+            item["writer"].writeframes(data.pcm)
+            item["bytes"] += len(data.pcm)
+
+    def cleanup(self):
+        with self.lock:
+            for item in self.files.values():
+                try:
+                    item["writer"].close()
+                except Exception:
+                    pass
+
+    def recorded_paths(self):
+        return [
+            item["path"]
+            for item in self.files.values()
+            if item["path"].exists() and item["bytes"] > 0
+        ]
+
+
 @bot.command(aliases=["setrecordchannel", "recchannel"])
 async def recordchannel(ctx, channel: discord.TextChannel = None):
     if not ctx.author.guild_permissions.manage_guild:
@@ -448,9 +512,10 @@ async def record(ctx):
     if ctx.voice_client:
         await ctx.voice_client.disconnect(force=True)
 
-    filename = f"recording-{ctx.guild.id}-{uuid4().hex}.wav"
-    path = recording_dir() / filename
-    sink = voice_recv.WaveSink(str(path))
+    session_id = f"recording-{ctx.guild.id}-{uuid4().hex}"
+    folder = recording_dir() / session_id
+    zip_path = recording_dir() / f"{session_id}.zip"
+    sink = MultiUserWaveSink(folder)
 
     try:
         vc = await voice_channel.connect(cls=voice_recv.VoiceRecvClient)
@@ -462,7 +527,7 @@ async def record(ctx):
             pass
 
         try:
-            path.unlink()
+            shutil.rmtree(folder)
         except Exception:
             pass
 
@@ -472,7 +537,8 @@ async def record(ctx):
         )
 
     ACTIVE_RECORDINGS[ctx.guild.id] = {
-        "path": path,
+        "folder": folder,
+        "zip_path": zip_path,
         "sink": sink,
         "voice_channel_id": voice_channel.id,
         "upload_channel_id": upload_channel.id,
@@ -518,7 +584,9 @@ async def stoprecord(ctx):
     except Exception:
         pass
 
-    path = state["path"]
+    sink = state["sink"]
+    folder = state["folder"]
+    zip_path = state["zip_path"]
     upload_channel = ctx.guild.get_channel(state["upload_channel_id"])
 
     if upload_channel is None:
@@ -527,15 +595,25 @@ async def stoprecord(ctx):
     await ctx.reply(embed=premium_embed(ctx, "recording stopped", f"Sending recording to {upload_channel.mention}."), mention_author=False)
 
     try:
-        if not path.exists() or path.stat().st_size < 1024:
+        files = sink.recorded_paths()
+
+        if not files:
             return await ctx.reply(
                 embed=warning_embed(ctx, "Recording had no usable audio. Check Railway logs."),
                 mention_author=False
             )
 
+        if len(files) == 1:
+            upload_file = files[0]
+        else:
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+                for file_path in files:
+                    archive.write(file_path, arcname=file_path.name)
+            upload_file = zip_path
+
         await upload_channel.send(
             content=f"Recording from **{ctx.guild.name}** stopped by {ctx.author.mention}.",
-            file=discord.File(str(path), filename=path.name)
+            file=discord.File(str(upload_file), filename=upload_file.name)
         )
     except discord.HTTPException:
         return await ctx.reply(
@@ -544,7 +622,13 @@ async def stoprecord(ctx):
         )
     finally:
         try:
-            path.unlink()
+            if zip_path.exists():
+                zip_path.unlink()
+        except Exception:
+            pass
+
+        try:
+            shutil.rmtree(folder)
         except Exception:
             pass
 
