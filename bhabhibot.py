@@ -13,6 +13,22 @@ try:
 except Exception:
     voice_recv = None
 
+if voice_recv is not None:
+    try:
+        from discord.ext.voice_recv import opus as voice_recv_opus
+
+        _original_decode_packet = voice_recv_opus.PacketDecoder._decode_packet
+
+        def _safe_decode_packet(self, packet):
+            try:
+                return _original_decode_packet(self, packet)
+            except discord.opus.OpusError:
+                return packet, b"\x00" * 3840
+
+        voice_recv_opus.PacketDecoder._decode_packet = _safe_decode_packet
+    except Exception:
+        pass
+
 TOKEN = os.getenv("TOKEN")
 PREFIX = "."
 DATA_FILE = "/app/data/triggers.json"
@@ -435,8 +451,25 @@ async def record(ctx):
     filename = f"recording-{ctx.guild.id}-{uuid4().hex}.wav"
     path = recording_dir() / filename
     sink = voice_recv.WaveSink(str(path))
-    vc = await voice_channel.connect(cls=voice_recv.VoiceRecvClient)
-    vc.listen(sink)
+
+    try:
+        vc = await voice_channel.connect(cls=voice_recv.VoiceRecvClient)
+        vc.listen(sink)
+    except Exception as e:
+        try:
+            sink.cleanup()
+        except Exception:
+            pass
+
+        try:
+            path.unlink()
+        except Exception:
+            pass
+
+        return await ctx.reply(
+            embed=warning_embed(ctx, f"Could not start voice recording: `{type(e).__name__}`"),
+            mention_author=False
+        )
 
     ACTIVE_RECORDINGS[ctx.guild.id] = {
         "path": path,
@@ -494,6 +527,12 @@ async def stoprecord(ctx):
     await ctx.reply(embed=premium_embed(ctx, "recording stopped", f"Sending recording to {upload_channel.mention}."), mention_author=False)
 
     try:
+        if not path.exists() or path.stat().st_size < 1024:
+            return await ctx.reply(
+                embed=warning_embed(ctx, "Recording had no usable audio. Check Railway logs."),
+                mention_author=False
+            )
+
         await upload_channel.send(
             content=f"Recording from **{ctx.guild.name}** stopped by {ctx.author.mention}.",
             file=discord.File(str(path), filename=path.name)
