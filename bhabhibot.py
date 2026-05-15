@@ -376,10 +376,15 @@ def mix_tracks_to_wav(input_paths, output_path):
     subprocess.run(command, check=True)
 
 
-async def pycord_recording_done(sink, ctx, upload_channel_id, folder, output_path):
-    folder = Path(folder)
-    output_path = Path(output_path)
-    upload_channel = ctx.guild.get_channel(upload_channel_id) if ctx.guild else None
+async def pycord_recording_done(sink, ctx):
+    state = ACTIVE_RECORDINGS.pop(ctx.guild.id, None) if ctx.guild else None
+
+    if state is None:
+        return
+
+    folder = Path(state["folder"])
+    output_path = Path(state["output_path"])
+    upload_channel = ctx.guild.get_channel(state["upload_channel_id"]) if ctx.guild else None
 
     try:
         if upload_channel is None:
@@ -531,9 +536,6 @@ async def record(ctx):
             sink,
             pycord_recording_done,
             ctx,
-            upload_channel.id,
-            folder,
-            output_path,
             sync_start=True
         )
     except Exception as e:
@@ -572,7 +574,7 @@ async def stoprecord(ctx):
     if not ctx.author.guild_permissions.manage_guild:
         return await ctx.reply(embed=missing_perm_embed(ctx, "manage_server"), mention_author=False)
 
-    state = ACTIVE_RECORDINGS.pop(ctx.guild.id, None)
+    state = ACTIVE_RECORDINGS.get(ctx.guild.id)
 
     if state is None:
         return await ctx.reply(embed=warning_embed(ctx, "No recording is running."), mention_author=False)
