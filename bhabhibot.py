@@ -8,6 +8,7 @@ import logging
 import os
 import subprocess
 import shutil
+import traceback
 from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -418,6 +419,7 @@ async def pycord_recording_done(sink, ctx):
     except subprocess.CalledProcessError:
         await ctx.reply(embed=warning_embed(ctx, "Could not mix recording tracks with ffmpeg."), mention_author=False)
     except Exception as e:
+        traceback.print_exc()
         await ctx.reply(embed=warning_embed(ctx, f"Recording failed: `{type(e).__name__}`"), mention_author=False)
     finally:
         try:
@@ -530,7 +532,7 @@ async def record(ctx):
     sink = discord.sinks.WaveSink()
 
     try:
-        vc = await voice_channel.connect(self_deaf=False, self_mute=False)
+        vc = await voice_channel.connect(self_deaf=False)
         await ctx.guild.me.edit(deafen=False, mute=False, reason="Voice recording started")
         vc.start_recording(
             sink,
@@ -539,6 +541,8 @@ async def record(ctx):
             sync_start=True
         )
     except Exception as e:
+        traceback.print_exc()
+
         try:
             shutil.rmtree(folder)
         except Exception:
@@ -592,6 +596,8 @@ async def stoprecord(ctx):
     try:
         vc.stop_recording()
     except Exception as e:
+        traceback.print_exc()
+
         return await ctx.reply(
             embed=warning_embed(ctx, f"Could not stop recording: `{type(e).__name__}`"),
             mention_author=False
