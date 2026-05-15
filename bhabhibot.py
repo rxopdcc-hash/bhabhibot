@@ -8,39 +8,13 @@ import logging
 import os
 import subprocess
 import shutil
-import threading
-import wave
 from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
 
-try:
-    from discord.ext import voice_recv
-except Exception:
-    voice_recv = None
-
-if voice_recv is not None:
-    try:
-        from discord.ext.voice_recv import opus as voice_recv_opus
-
-        _original_decode_packet = voice_recv_opus.PacketDecoder._decode_packet
-
-        def _decode_packet_skip_corrupt(self, packet):
-            try:
-                return _original_decode_packet(self, packet)
-            except discord.opus.OpusError:
-                self.reset()
-                return packet, b""
-
-        voice_recv_opus.PacketDecoder._decode_packet = _decode_packet_skip_corrupt
-    except Exception:
-        pass
-
 TOKEN = os.getenv("TOKEN")
 PREFIX = "."
 DATA_FILE = "/app/data/triggers.json"
-
-logging.getLogger("discord.ext.voice_recv.gateway").setLevel(logging.WARNING)
 
 DEFAULT_COLOR = 0x2B2D42
 ERROR_COLOR = 0xFEE75C
@@ -379,68 +353,6 @@ def recording_dir():
     return path
 
 
-class AlignedUserWaveSink(voice_recv.AudioSink if voice_recv is not None else object):
-    channels = 2
-    sample_width = 2
-    sample_rate = 48000
-
-    def __init__(self, folder):
-        if voice_recv is not None:
-            super().__init__()
-        self.folder = Path(folder)
-        self.folder.mkdir(parents=True, exist_ok=True)
-        self.files = {}
-        self.lock = threading.Lock()
-        self.packet_count = 0
-        self.pcm_bytes = 0
-
-    def wants_opus(self):
-        return False
-
-    def get_writer(self, user):
-        user_id = user.id if user else "unknown-source"
-
-        if user_id not in self.files:
-            file_path = self.folder / f"track-{user_id}.wav"
-            writer = wave.open(str(file_path), "wb")
-            writer.setnchannels(self.channels)
-            writer.setsampwidth(self.sample_width)
-            writer.setframerate(self.sample_rate)
-            self.files[user_id] = {
-                "writer": writer,
-                "path": file_path,
-                "bytes": 0
-            }
-
-        return self.files[user_id]
-
-    def write(self, user, data):
-        if not data.pcm:
-            return
-
-        with self.lock:
-            item = self.get_writer(user)
-            item["writer"].writeframes(data.pcm)
-            item["bytes"] += len(data.pcm)
-            self.packet_count += 1
-            self.pcm_bytes += len(data.pcm)
-
-    def cleanup(self):
-        with self.lock:
-            for item in self.files.values():
-                try:
-                    item["writer"].close()
-                except Exception:
-                    pass
-
-    def recorded_paths(self):
-        return [
-            item["path"]
-            for item in self.files.values()
-            if item["path"].exists() and item["bytes"] > 0
-        ]
-
-
 def mix_tracks_to_wav(input_paths, output_path):
     if len(input_paths) == 1:
         shutil.copyfile(input_paths[0], output_path)
@@ -462,6 +374,63 @@ def mix_tracks_to_wav(input_paths, output_path):
     ])
 
     subprocess.run(command, check=True)
+
+
+async def pycord_recording_done(sink, ctx, upload_channel_id, folder, output_path):
+    folder = Path(folder)
+    output_path = Path(output_path)
+    upload_channel = ctx.guild.get_channel(upload_channel_id) if ctx.guild else None
+
+    try:
+        if upload_channel is None:
+            return await ctx.reply(embed=warning_embed(ctx, "Upload channel was deleted or not found."), mention_author=False)
+
+        files = []
+
+        for user_id, audio in sink.audio_data.items():
+            file_path = folder / f"track-{user_id}.wav"
+            audio.file.seek(0)
+
+            with open(file_path, "wb") as f:
+                shutil.copyfileobj(audio.file, f)
+
+            if file_path.exists() and file_path.stat().st_size > 1024:
+                files.append(file_path)
+
+        print(f"Pycord recording stopped: sources={len(sink.audio_data)}, files={len(files)}", flush=True)
+
+        if not files:
+            return await ctx.reply(embed=warning_embed(ctx, "Recording had no usable audio."), mention_author=False)
+
+        mix_tracks_to_wav(files, output_path)
+
+        await upload_channel.send(
+            content=f"Recording from **{ctx.guild.name}** stopped by {ctx.author.mention}.",
+            file=discord.File(str(output_path), filename=output_path.name)
+        )
+    except discord.HTTPException:
+        await ctx.reply(embed=warning_embed(ctx, "Recording file is too large for Discord upload."), mention_author=False)
+    except subprocess.CalledProcessError:
+        await ctx.reply(embed=warning_embed(ctx, "Could not mix recording tracks with ffmpeg."), mention_author=False)
+    except Exception as e:
+        await ctx.reply(embed=warning_embed(ctx, f"Recording failed: `{type(e).__name__}`"), mention_author=False)
+    finally:
+        try:
+            if ctx.voice_client:
+                await ctx.voice_client.disconnect(force=True)
+        except Exception:
+            pass
+
+        try:
+            if output_path.exists():
+                output_path.unlink()
+        except Exception:
+            pass
+
+        try:
+            shutil.rmtree(folder)
+        except Exception:
+            pass
 
 
 @bot.command(aliases=["setrecordchannel", "recchannel"])
@@ -509,9 +478,9 @@ async def record(ctx):
     if not ctx.author.guild_permissions.manage_guild:
         return await ctx.reply(embed=missing_perm_embed(ctx, "manage_server"), mention_author=False)
 
-    if voice_recv is None:
+    if not hasattr(discord, "sinks") or not hasattr(discord.sinks, "WaveSink"):
         return await ctx.reply(
-            embed=warning_embed(ctx, "Install `discord-ext-voice-recv` and `PyNaCl` first."),
+            embed=warning_embed(ctx, "Pycord voice recording is not available. Check `py-cord[voice]` install."),
             mention_author=False
         )
 
@@ -552,23 +521,22 @@ async def record(ctx):
     session_id = f"recording-{ctx.guild.id}-{uuid4().hex}"
     folder = recording_dir() / session_id
     output_path = recording_dir() / f"{session_id}.wav"
-    sink = AlignedUserWaveSink(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    sink = discord.sinks.WaveSink()
 
     try:
-        vc = await voice_channel.connect(
-            cls=voice_recv.VoiceRecvClient,
-            self_deaf=False,
-            self_mute=False
-        )
+        vc = await voice_channel.connect(self_deaf=False, self_mute=False)
         await ctx.guild.me.edit(deafen=False, mute=False, reason="Voice recording started")
-        await asyncio.sleep(0.5)
-        vc.listen(sink)
+        vc.start_recording(
+            sink,
+            pycord_recording_done,
+            ctx,
+            upload_channel.id,
+            folder,
+            output_path,
+            sync_start=True
+        )
     except Exception as e:
-        try:
-            sink.cleanup()
-        except Exception:
-            pass
-
         try:
             shutil.rmtree(folder)
         except Exception:
@@ -582,8 +550,6 @@ async def record(ctx):
     ACTIVE_RECORDINGS[ctx.guild.id] = {
         "folder": folder,
         "output_path": output_path,
-        "sink": sink,
-        "track_sink": sink,
         "voice_channel_id": voice_channel.id,
         "upload_channel_id": upload_channel.id,
         "started_by": ctx.author.id
@@ -611,77 +577,25 @@ async def stoprecord(ctx):
     if state is None:
         return await ctx.reply(embed=warning_embed(ctx, "No recording is running."), mention_author=False)
 
-    vc = ctx.voice_client
-
-    if vc:
-        try:
-            if getattr(vc, "is_listening", lambda: False)():
-                vc.stop_listening()
-                await asyncio.sleep(1)
-        except Exception:
-            pass
-
-        try:
-            await vc.disconnect(force=True)
-        except Exception:
-            pass
-
-    try:
-        state["sink"].cleanup()
-    except Exception:
-        pass
-
-    sink = state["track_sink"]
-    folder = state["folder"]
-    output_path = state["output_path"]
     upload_channel = ctx.guild.get_channel(state["upload_channel_id"])
 
     if upload_channel is None:
         return await ctx.reply(embed=warning_embed(ctx, "Upload channel was deleted or not found."), mention_author=False)
 
-    await ctx.reply(embed=premium_embed(ctx, "recording stopped", f"Sending recording to {upload_channel.mention}."), mention_author=False)
+    vc = ctx.voice_client
+
+    if not vc:
+        return await ctx.reply(embed=warning_embed(ctx, "Voice client was not found."), mention_author=False)
 
     try:
-        files = sink.recorded_paths()
-
-        print(
-            f"Recording stopped: packets={sink.packet_count}, pcm_bytes={sink.pcm_bytes}, sources={len(sink.files)}, files={len(files)}",
-            flush=True
-        )
-
-        if not files:
-            return await ctx.reply(
-                embed=warning_embed(ctx, f"Recording had no usable audio. Packets: `{sink.packet_count}`, PCM bytes: `{sink.pcm_bytes}`."),
-                mention_author=False
-            )
-
-        mix_tracks_to_wav(files, output_path)
-
-        await upload_channel.send(
-            content=f"Recording from **{ctx.guild.name}** stopped by {ctx.author.mention}.",
-            file=discord.File(str(output_path), filename=output_path.name)
-        )
-    except discord.HTTPException:
+        vc.stop_recording()
+    except Exception as e:
         return await ctx.reply(
-            embed=warning_embed(ctx, "Recording file is too large for Discord upload."),
+            embed=warning_embed(ctx, f"Could not stop recording: `{type(e).__name__}`"),
             mention_author=False
         )
-    except subprocess.CalledProcessError:
-        return await ctx.reply(
-            embed=warning_embed(ctx, "Could not mix recording tracks with ffmpeg."),
-            mention_author=False
-        )
-    finally:
-        try:
-            if output_path.exists():
-                output_path.unlink()
-        except Exception:
-            pass
 
-        try:
-            shutil.rmtree(folder)
-        except Exception:
-            pass
+    await ctx.reply(embed=premium_embed(ctx, "recording stopped", f"Processing and sending recording to {upload_channel.mention}."), mention_author=False)
 
 
 @bot.command()
@@ -1138,7 +1052,7 @@ async def on_presence_update(before, after):
 
 @bot.event
 async def on_ready():
-    print(f"discord.py version: {discord.__version__}", flush=True)
+    print(f"discord library version: {discord.__version__}", flush=True)
 
     try:
         import davey
