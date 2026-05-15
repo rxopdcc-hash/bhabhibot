@@ -398,9 +398,18 @@ def mix_tracks_to_wav(input_paths, output_path):
 async def start_recording_when_ready(vc, sink, ctx):
     last_error = None
 
-    for _ in range(10):
+    for _ in range(20):
+        active_vc = ctx.guild.voice_client or vc
+
+        if not active_vc.is_connected():
+            ws_ready = getattr(active_vc, "ws", None) is not None
+            socket_ready = getattr(active_vc, "socket", None) is not None
+
+            if ws_ready and socket_ready and hasattr(active_vc, "_connected"):
+                active_vc._connected.set()
+
         try:
-            vc.start_recording(
+            active_vc.start_recording(
                 sink,
                 pycord_recording_done,
                 ctx,
@@ -413,7 +422,7 @@ async def start_recording_when_ready(vc, sink, ctx):
             if e.__class__.__name__ != "RecordingException":
                 raise
 
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(1)
 
     raise last_error
 
@@ -573,6 +582,8 @@ async def record(ctx):
 
     try:
         vc = await voice_channel.connect()
+        await ctx.guild.change_voice_state(channel=voice_channel, self_mute=False, self_deaf=False)
+        await asyncio.sleep(1)
         await start_recording_when_ready(vc, sink, ctx)
     except Exception as e:
         print(f"Could not start voice recording: {type(e).__name__}: {e}", flush=True)
