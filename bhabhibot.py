@@ -481,7 +481,7 @@ def mix_tracks_to_wav(input_paths, output_path):
 
     command.extend([
         "-filter_complex",
-        f"amix=inputs={len(input_paths)}:duration=longest:normalize=0",
+        f"amix=inputs={len(input_paths)}:duration=longest:normalize=1",
         "-ar",
         "48000",
         "-ac",
@@ -580,7 +580,7 @@ async def record(ctx):
     session_id = f"recording-{ctx.guild.id}-{uuid4().hex}"
     folder = recording_dir() / session_id
     output_path = recording_dir() / f"{session_id}.wav"
-    sink = voice_recv.SilenceGeneratorSink(AlignedUserWaveSink(folder))
+    sink = AlignedUserWaveSink(folder)
 
     try:
         vc = await voice_channel.connect(
@@ -611,7 +611,7 @@ async def record(ctx):
         "folder": folder,
         "output_path": output_path,
         "sink": sink,
-        "track_sink": sink.destination,
+        "track_sink": sink,
         "voice_channel_id": voice_channel.id,
         "upload_channel_id": upload_channel.id,
         "started_by": ctx.author.id
@@ -1167,6 +1167,12 @@ async def on_presence_update(before, after):
 @bot.event
 async def on_ready():
     print(f"discord.py version: {discord.__version__}", flush=True)
+
+    try:
+        import davey
+        print(f"davey loaded: {getattr(davey, '__version__', 'installed')}", flush=True)
+    except Exception:
+        print("davey not loaded; Discord DAVE voice may sound corrupted", flush=True)
 
     if ensure_opus_loaded():
         print("Opus loaded for voice recording", flush=True)
