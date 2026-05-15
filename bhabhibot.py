@@ -1,8 +1,15 @@
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 import json
 import os
 from datetime import timedelta
+from pathlib import Path
+from uuid import uuid4
+
+try:
+    from discord.ext import voice_recv
+except Exception:
+    voice_recv = None
 
 TOKEN = os.getenv("TOKEN")
 PREFIX = "."
@@ -35,6 +42,12 @@ DEFAULT_TRIGGERS = {
     "mute": []
 }
 
+DEFAULT_RECORDING = {
+    "channel_id": None
+}
+
+ACTIVE_RECORDINGS = {}
+
 
 def load_data():
     if not os.path.exists(DATA_FILE):
@@ -47,6 +60,7 @@ def load_data():
         data[gid].pop("timeout", None)
         for key in DEFAULT_TRIGGERS:
             data[gid].setdefault(key, [])
+        data[gid].setdefault("recording", DEFAULT_RECORDING.copy())
 
     return data
 
@@ -67,7 +81,8 @@ def setup_guild(guild_id):
             "ban": [],
             "kick": [],
             "mute": [],
-            "vanity": DEFAULT_VANITY.copy()
+            "vanity": DEFAULT_VANITY.copy(),
+            "recording": DEFAULT_RECORDING.copy()
         }
 
         save_data()
@@ -78,6 +93,7 @@ def setup_guild(guild_id):
         TRIGGERS[gid].setdefault(key, [])
 
     TRIGGERS[gid].setdefault("vanity", DEFAULT_VANITY.copy())
+    TRIGGERS[gid].setdefault("recording", DEFAULT_RECORDING.copy())
 
     return gid
 
@@ -291,6 +307,163 @@ async def unban(ctx, user_id: int = None):
     user = await bot.fetch_user(user_id)
     await ctx.guild.unban(user, reason=f"{ctx.author} unbanned user")
     await ctx.reply(embed=premium_embed(ctx, "unbanned", f"**{user}** has been unbanned."), mention_author=False)
+
+
+def recording_dir():
+    base = Path(DATA_FILE).parent
+    path = base / "recordings"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+@bot.command(aliases=["setrecordchannel", "recchannel"])
+async def recordchannel(ctx, channel: discord.TextChannel = None):
+    if not ctx.author.guild_permissions.manage_guild:
+        return await ctx.reply(embed=missing_perm_embed(ctx, "manage_server"), mention_author=False)
+
+    if channel is None:
+        return await ctx.reply(
+            embed=premium_embed(ctx, "recordchannel", "Set the channel where recordings are sent", ".recordchannel (channel)", ".recordchannel #admin"),
+            mention_author=False
+        )
+
+    gid = setup_guild(ctx.guild.id)
+    TRIGGERS[gid]["recording"]["channel_id"] = channel.id
+    save_data()
+
+    await ctx.reply(
+        embed=premium_embed(ctx, "recording channel updated", f"Recordings will be sent to {channel.mention}."),
+        mention_author=False
+    )
+
+
+@bot.command(aliases=["recsettings"])
+async def recordsettings(ctx):
+    if not ctx.author.guild_permissions.manage_guild:
+        return await ctx.reply(embed=missing_perm_embed(ctx, "manage_server"), mention_author=False)
+
+    gid = setup_guild(ctx.guild.id)
+    channel_id = TRIGGERS[gid]["recording"].get("channel_id")
+    channel = ctx.guild.get_channel(channel_id) if channel_id else None
+    status = "recording" if ctx.guild.id in ACTIVE_RECORDINGS else "not recording"
+
+    text = (
+        f"**upload channel**: {channel.mention if channel else '`not set`'}\n"
+        f"**status**: `{status}`\n"
+        f"**format**: `wav, 48khz stereo`"
+    )
+
+    await ctx.reply(embed=premium_embed(ctx, "recording settings", text), mention_author=False)
+
+
+@bot.command(aliases=["rec"])
+async def record(ctx):
+    if not ctx.author.guild_permissions.manage_guild:
+        return await ctx.reply(embed=missing_perm_embed(ctx, "manage_server"), mention_author=False)
+
+    if voice_recv is None:
+        return await ctx.reply(
+            embed=warning_embed(ctx, "Install `discord-ext-voice-recv` and `PyNaCl` first."),
+            mention_author=False
+        )
+
+    if not ctx.author.voice or not ctx.author.voice.channel:
+        return await ctx.reply(embed=warning_embed(ctx, "Join a voice channel first."), mention_author=False)
+
+    if ctx.guild.id in ACTIVE_RECORDINGS:
+        return await ctx.reply(embed=warning_embed(ctx, "A recording is already running."), mention_author=False)
+
+    gid = setup_guild(ctx.guild.id)
+    channel_id = TRIGGERS[gid]["recording"].get("channel_id")
+    upload_channel = ctx.guild.get_channel(channel_id) if channel_id else None
+
+    if upload_channel is None:
+        return await ctx.reply(
+            embed=warning_embed(ctx, "Set an upload channel first with `.recordchannel #channel`."),
+            mention_author=False
+        )
+
+    voice_channel = ctx.author.voice.channel
+
+    if ctx.voice_client:
+        await ctx.voice_client.disconnect(force=True)
+
+    filename = f"recording-{ctx.guild.id}-{uuid4().hex}.wav"
+    path = recording_dir() / filename
+    sink = voice_recv.WaveSink(str(path))
+    vc = await voice_channel.connect(cls=voice_recv.VoiceRecvClient)
+    vc.listen(sink)
+
+    ACTIVE_RECORDINGS[ctx.guild.id] = {
+        "path": path,
+        "sink": sink,
+        "voice_channel_id": voice_channel.id,
+        "upload_channel_id": upload_channel.id,
+        "started_by": ctx.author.id
+    }
+
+    await ctx.reply(
+        embed=premium_embed(
+            ctx,
+            "recording started",
+            f"Now recording {voice_channel.mention}.\nEveryone in the voice channel should know this is being recorded."
+        ),
+        mention_author=False
+    )
+
+
+@bot.command(aliases=["stoprec", "stoprecording"])
+async def stoprecord(ctx):
+    if not ctx.author.guild_permissions.manage_guild:
+        return await ctx.reply(embed=missing_perm_embed(ctx, "manage_server"), mention_author=False)
+
+    state = ACTIVE_RECORDINGS.pop(ctx.guild.id, None)
+
+    if state is None:
+        return await ctx.reply(embed=warning_embed(ctx, "No recording is running."), mention_author=False)
+
+    vc = ctx.voice_client
+
+    if vc:
+        try:
+            if getattr(vc, "is_listening", lambda: False)():
+                vc.stop_listening()
+        except Exception:
+            pass
+
+        try:
+            await vc.disconnect(force=True)
+        except Exception:
+            pass
+
+    try:
+        state["sink"].cleanup()
+    except Exception:
+        pass
+
+    path = state["path"]
+    upload_channel = ctx.guild.get_channel(state["upload_channel_id"])
+
+    if upload_channel is None:
+        return await ctx.reply(embed=warning_embed(ctx, "Upload channel was deleted or not found."), mention_author=False)
+
+    await ctx.reply(embed=premium_embed(ctx, "recording stopped", f"Sending recording to {upload_channel.mention}."), mention_author=False)
+
+    try:
+        await upload_channel.send(
+            content=f"Recording from **{ctx.guild.name}** stopped by {ctx.author.mention}.",
+            file=discord.File(str(path), filename=path.name)
+        )
+    except discord.HTTPException:
+        return await ctx.reply(
+            embed=warning_embed(ctx, "Recording file is too large for Discord upload."),
+            mention_author=False
+        )
+    finally:
+        try:
+            path.unlink()
+        except Exception:
+            pass
 
 
 @bot.command()
@@ -745,87 +918,8 @@ async def on_presence_update(before, after):
         except:
             pass
 
-@tasks.loop(seconds=3)
-async def vanity_bio_check():
-    await bot.wait_until_ready()
-
-    for guild in bot.guilds:
-        gid = setup_guild(guild.id)
-
-        vanity = TRIGGERS[gid]["vanity"]
-
-        if not vanity["enabled"]:
-            continue
-
-        role_id = vanity["role_id"]
-
-        if not role_id:
-            continue
-
-        role = guild.get_role(role_id)
-
-        if not role:
-            continue
-
-        triggers = vanity["triggers"]
-
-        if not triggers:
-            continue
-
-        channel = guild.get_channel(vanity["channel_id"]) if vanity["channel_id"] else None
-
-        for member in guild.members:
-            if member.bot:
-                continue
-
-            try:
-                fetched = await bot.fetch_user(member.id)
-
-                bio = (fetched.bio or "").lower()
-
-                matched = any(trigger.lower() in bio for trigger in triggers)
-
-                has_role = role in member.roles
-
-                # GIVE ROLE
-                if matched and not has_role:
-                    await member.add_roles(role, reason="Vanity bio detected")
-
-                    if channel:
-                        msg = vanity["message"]
-
-                        msg = msg.replace("{user}", member.mention)
-                        msg = msg.replace("{server}", guild.name)
-                        msg = msg.replace("{role}", role.mention)
-
-                        embed = discord.Embed(
-                            description=msg,
-                            color=int(vanity["remove_color"], 16)
-                        )
-
-                        await channel.send(embed=embed)
-
-                # REMOVE ROLE
-                elif not matched and has_role:
-                    await member.remove_roles(role, reason="Vanity bio removed")
-
-                    if channel:
-                        embed = discord.Embed(
-                            description=vanity["remove_message"].replace("{user}", member.mention),
-                            color=int(vanity["remove_color"], 16)
-                        )
-
-                        await channel.send(embed=embed)
-
-            except:
-                pass
-
-
 @bot.event
 async def on_ready():
-    if not vanity_bio_check.is_running():
-        vanity_bio_check.start()
-
     print(f"Logged in as {bot.user}")
 
 
