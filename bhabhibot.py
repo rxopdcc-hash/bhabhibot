@@ -1,6 +1,7 @@
 import discord
 from discord.ext import commands
 import ctypes.util
+import glob
 import json
 import os
 from datetime import timedelta
@@ -54,8 +55,20 @@ def ensure_opus_loaded():
     if discord.opus.is_loaded():
         return True
 
+    library_paths = []
+
+    for env_name in ["LD_LIBRARY_PATH", "LIBRARY_PATH"]:
+        for folder in os.getenv(env_name, "").split(os.pathsep):
+            if folder:
+                library_paths.extend(glob.glob(os.path.join(folder, "libopus.so*")))
+
+    library_paths.extend(glob.glob("/usr/lib/**/libopus.so*", recursive=True))
+    library_paths.extend(glob.glob("/lib/**/libopus.so*", recursive=True))
+    library_paths.extend(glob.glob("/nix/store/**/lib/libopus.so*", recursive=True))
+
     names = [
         ctypes.util.find_library("opus"),
+        *library_paths,
         "libopus.so.0",
         "libopus.so",
         "opus",
