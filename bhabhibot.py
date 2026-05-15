@@ -1,14 +1,15 @@
 import discord
 from discord.ext import commands
+import asyncio
 import ctypes.util
 import glob
 import json
+import logging
 import os
-import re
+import subprocess
 import shutil
 import threading
 import wave
-import zipfile
 from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -18,25 +19,11 @@ try:
 except Exception:
     voice_recv = None
 
-if voice_recv is not None:
-    try:
-        from discord.ext.voice_recv import opus as voice_recv_opus
-
-        _original_decode_packet = voice_recv_opus.PacketDecoder._decode_packet
-
-        def _safe_decode_packet(self, packet):
-            try:
-                return _original_decode_packet(self, packet)
-            except discord.opus.OpusError:
-                return packet, b"\x00" * 3840
-
-        voice_recv_opus.PacketDecoder._decode_packet = _safe_decode_packet
-    except Exception:
-        pass
-
 TOKEN = os.getenv("TOKEN")
 PREFIX = "."
 DATA_FILE = "/app/data/triggers.json"
+
+logging.getLogger("discord.ext.voice_recv.gateway").setLevel(logging.WARNING)
 
 DEFAULT_COLOR = 0x2B2D42
 ERROR_COLOR = 0xFEE75C
@@ -375,7 +362,7 @@ def recording_dir():
     return path
 
 
-class MultiUserWaveSink(voice_recv.AudioSink if voice_recv is not None else object):
+class AlignedUserWaveSink(voice_recv.AudioSink if voice_recv is not None else object):
     channels = 2
     sample_width = 2
     sample_rate = 48000
@@ -386,37 +373,63 @@ class MultiUserWaveSink(voice_recv.AudioSink if voice_recv is not None else obje
         self.folder = Path(folder)
         self.folder.mkdir(parents=True, exist_ok=True)
         self.files = {}
+        self.base_timestamp = None
         self.lock = threading.Lock()
+        self.packet_count = 0
+        self.pcm_bytes = 0
 
     def wants_opus(self):
         return False
 
-    def safe_name(self, user):
-        raw = str(user) if user else "unknown"
-        clean = re.sub(r"[^a-zA-Z0-9_.-]+", "_", raw).strip("_")
-        return clean[:60] or "unknown"
+    def timestamp_delta(self, timestamp, base):
+        delta = (timestamp - base) & 0xFFFFFFFF
+
+        if delta > 0x7FFFFFFF:
+            delta -= 0x100000000
+
+        return max(delta, 0)
 
     def get_writer(self, user):
         user_id = user.id if user else "unknown"
 
         if user_id not in self.files:
-            file_path = self.folder / f"{self.safe_name(user)}-{user_id}.wav"
+            file_path = self.folder / f"track-{user_id}.wav"
             writer = wave.open(str(file_path), "wb")
             writer.setnchannels(self.channels)
             writer.setsampwidth(self.sample_width)
             writer.setframerate(self.sample_rate)
-            self.files[user_id] = {"writer": writer, "path": file_path, "bytes": 0}
+            self.files[user_id] = {
+                "writer": writer,
+                "path": file_path,
+                "next_frame": 0,
+                "bytes": 0
+            }
 
         return self.files[user_id]
 
     def write(self, user, data):
-        if not data.pcm:
+        if not data.pcm or not data.packet:
             return
 
         with self.lock:
+            frame_size = self.channels * self.sample_width
+            frames = len(data.pcm) // frame_size
+
+            if self.base_timestamp is None:
+                self.base_timestamp = data.packet.timestamp
+
             item = self.get_writer(user)
+            target_frame = self.timestamp_delta(data.packet.timestamp, self.base_timestamp)
+            gap = target_frame - item["next_frame"]
+
+            if gap > 0:
+                item["writer"].writeframes(b"\x00" * gap * frame_size)
+
             item["writer"].writeframes(data.pcm)
+            item["next_frame"] = max(item["next_frame"], target_frame + frames)
             item["bytes"] += len(data.pcm)
+            self.packet_count += 1
+            self.pcm_bytes += len(data.pcm)
 
     def cleanup(self):
         with self.lock:
@@ -432,6 +445,29 @@ class MultiUserWaveSink(voice_recv.AudioSink if voice_recv is not None else obje
             for item in self.files.values()
             if item["path"].exists() and item["bytes"] > 0
         ]
+
+
+def mix_tracks_to_wav(input_paths, output_path):
+    if len(input_paths) == 1:
+        shutil.copyfile(input_paths[0], output_path)
+        return
+
+    command = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+
+    for input_path in input_paths:
+        command.extend(["-i", str(input_path)])
+
+    command.extend([
+        "-filter_complex",
+        f"amix=inputs={len(input_paths)}:duration=longest:normalize=0",
+        "-ar",
+        "48000",
+        "-ac",
+        "2",
+        str(output_path)
+    ])
+
+    subprocess.run(command, check=True)
 
 
 @bot.command(aliases=["setrecordchannel", "recchannel"])
@@ -514,11 +550,12 @@ async def record(ctx):
 
     session_id = f"recording-{ctx.guild.id}-{uuid4().hex}"
     folder = recording_dir() / session_id
-    zip_path = recording_dir() / f"{session_id}.zip"
-    sink = MultiUserWaveSink(folder)
+    output_path = recording_dir() / f"{session_id}.wav"
+    sink = voice_recv.SilenceGeneratorSink(AlignedUserWaveSink(folder))
 
     try:
         vc = await voice_channel.connect(cls=voice_recv.VoiceRecvClient)
+        await asyncio.sleep(1)
         vc.listen(sink)
     except Exception as e:
         try:
@@ -538,12 +575,15 @@ async def record(ctx):
 
     ACTIVE_RECORDINGS[ctx.guild.id] = {
         "folder": folder,
-        "zip_path": zip_path,
+        "output_path": output_path,
         "sink": sink,
+        "track_sink": sink.destination,
         "voice_channel_id": voice_channel.id,
         "upload_channel_id": upload_channel.id,
         "started_by": ctx.author.id
     }
+
+    print(f"Recording started in guild={ctx.guild.id}, channel={voice_channel.id}", flush=True)
 
     await ctx.reply(
         embed=premium_embed(
@@ -571,6 +611,7 @@ async def stoprecord(ctx):
         try:
             if getattr(vc, "is_listening", lambda: False)():
                 vc.stop_listening()
+                await asyncio.sleep(1)
         except Exception:
             pass
 
@@ -584,9 +625,9 @@ async def stoprecord(ctx):
     except Exception:
         pass
 
-    sink = state["sink"]
+    sink = state["track_sink"]
     folder = state["folder"]
-    zip_path = state["zip_path"]
+    output_path = state["output_path"]
     upload_channel = ctx.guild.get_channel(state["upload_channel_id"])
 
     if upload_channel is None:
@@ -597,33 +638,37 @@ async def stoprecord(ctx):
     try:
         files = sink.recorded_paths()
 
+        print(
+            f"Recording stopped: packets={sink.packet_count}, pcm_bytes={sink.pcm_bytes}, files={len(files)}",
+            flush=True
+        )
+
         if not files:
             return await ctx.reply(
-                embed=warning_embed(ctx, "Recording had no usable audio. Check Railway logs."),
+                embed=warning_embed(ctx, f"Recording had no usable audio. Packets: `{sink.packet_count}`, PCM bytes: `{sink.pcm_bytes}`."),
                 mention_author=False
             )
 
-        if len(files) == 1:
-            upload_file = files[0]
-        else:
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
-                for file_path in files:
-                    archive.write(file_path, arcname=file_path.name)
-            upload_file = zip_path
+        mix_tracks_to_wav(files, output_path)
 
         await upload_channel.send(
             content=f"Recording from **{ctx.guild.name}** stopped by {ctx.author.mention}.",
-            file=discord.File(str(upload_file), filename=upload_file.name)
+            file=discord.File(str(output_path), filename=output_path.name)
         )
     except discord.HTTPException:
         return await ctx.reply(
             embed=warning_embed(ctx, "Recording file is too large for Discord upload."),
             mention_author=False
         )
+    except subprocess.CalledProcessError:
+        return await ctx.reply(
+            embed=warning_embed(ctx, "Could not mix recording tracks with ffmpeg."),
+            mention_author=False
+        )
     finally:
         try:
-            if zip_path.exists():
-                zip_path.unlink()
+            if output_path.exists():
+                output_path.unlink()
         except Exception:
             pass
 
@@ -1087,14 +1132,14 @@ async def on_presence_update(before, after):
 
 @bot.event
 async def on_ready():
-    print(f"discord.py version: {discord.__version__}")
+    print(f"discord.py version: {discord.__version__}", flush=True)
 
     if ensure_opus_loaded():
-        print("Opus loaded for voice recording")
+        print("Opus loaded for voice recording", flush=True)
     else:
-        print("Opus not loaded; voice recording will not work")
+        print("Opus not loaded; voice recording will not work", flush=True)
 
-    print(f"Logged in as {bot.user}")
+    print(f"Logged in as {bot.user}", flush=True)
 
 
 bot.run(TOKEN)
