@@ -390,7 +390,7 @@ class AlignedUserWaveSink(voice_recv.AudioSink if voice_recv is not None else ob
         return max(delta, 0)
 
     def get_writer(self, user):
-        user_id = user.id if user else "unknown"
+        user_id = user.id if user else "unknown-source"
 
         if user_id not in self.files:
             file_path = self.folder / f"track-{user_id}.wav"
@@ -408,18 +408,23 @@ class AlignedUserWaveSink(voice_recv.AudioSink if voice_recv is not None else ob
         return self.files[user_id]
 
     def write(self, user, data):
-        if not data.pcm or not data.packet:
+        if not data.pcm:
             return
 
         with self.lock:
             frame_size = self.channels * self.sample_width
             frames = len(data.pcm) // frame_size
 
+            packet_timestamp = getattr(data.packet, "timestamp", None)
+
+            if packet_timestamp is None:
+                packet_timestamp = self.base_timestamp if self.base_timestamp is not None else 0
+
             if self.base_timestamp is None:
-                self.base_timestamp = data.packet.timestamp
+                self.base_timestamp = packet_timestamp
 
             item = self.get_writer(user)
-            target_frame = self.timestamp_delta(data.packet.timestamp, self.base_timestamp)
+            target_frame = self.timestamp_delta(packet_timestamp, self.base_timestamp)
             gap = target_frame - item["next_frame"]
 
             if gap > 0:
@@ -554,8 +559,10 @@ async def record(ctx):
     sink = voice_recv.SilenceGeneratorSink(AlignedUserWaveSink(folder))
 
     try:
-        vc = await voice_channel.connect(cls=voice_recv.VoiceRecvClient)
-        await asyncio.sleep(1)
+        vc = await voice_channel.connect(
+            cls=voice_recv.VoiceRecvClient,
+            self_deaf=False
+        )
         vc.listen(sink)
     except Exception as e:
         try:
@@ -639,7 +646,7 @@ async def stoprecord(ctx):
         files = sink.recorded_paths()
 
         print(
-            f"Recording stopped: packets={sink.packet_count}, pcm_bytes={sink.pcm_bytes}, files={len(files)}",
+            f"Recording stopped: packets={sink.packet_count}, pcm_bytes={sink.pcm_bytes}, sources={len(sink.files)}, files={len(files)}",
             flush=True
         )
 
