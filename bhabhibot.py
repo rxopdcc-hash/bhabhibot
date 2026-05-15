@@ -390,21 +390,12 @@ class AlignedUserWaveSink(voice_recv.AudioSink if voice_recv is not None else ob
         self.folder = Path(folder)
         self.folder.mkdir(parents=True, exist_ok=True)
         self.files = {}
-        self.base_timestamp = None
         self.lock = threading.Lock()
         self.packet_count = 0
         self.pcm_bytes = 0
 
     def wants_opus(self):
         return False
-
-    def timestamp_delta(self, timestamp, base):
-        delta = (timestamp - base) & 0xFFFFFFFF
-
-        if delta > 0x7FFFFFFF:
-            delta -= 0x100000000
-
-        return max(delta, 0)
 
     def get_writer(self, user):
         user_id = user.id if user else "unknown-source"
@@ -418,7 +409,6 @@ class AlignedUserWaveSink(voice_recv.AudioSink if voice_recv is not None else ob
             self.files[user_id] = {
                 "writer": writer,
                 "path": file_path,
-                "next_frame": 0,
                 "bytes": 0
             }
 
@@ -429,26 +419,8 @@ class AlignedUserWaveSink(voice_recv.AudioSink if voice_recv is not None else ob
             return
 
         with self.lock:
-            frame_size = self.channels * self.sample_width
-            frames = len(data.pcm) // frame_size
-
-            packet_timestamp = getattr(data.packet, "timestamp", None)
-
-            if packet_timestamp is None:
-                packet_timestamp = self.base_timestamp if self.base_timestamp is not None else 0
-
-            if self.base_timestamp is None:
-                self.base_timestamp = packet_timestamp
-
             item = self.get_writer(user)
-            target_frame = self.timestamp_delta(packet_timestamp, self.base_timestamp)
-            gap = target_frame - item["next_frame"]
-
-            if gap > 0:
-                item["writer"].writeframes(b"\x00" * gap * frame_size)
-
             item["writer"].writeframes(data.pcm)
-            item["next_frame"] = max(item["next_frame"], target_frame + frames)
             item["bytes"] += len(data.pcm)
             self.packet_count += 1
             self.pcm_bytes += len(data.pcm)
