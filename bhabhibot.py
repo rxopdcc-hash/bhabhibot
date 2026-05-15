@@ -532,7 +532,7 @@ async def record(ctx):
     sink = discord.sinks.WaveSink()
 
     try:
-        vc = await voice_channel.connect(self_deaf=False)
+        vc = await voice_channel.connect()
         await ctx.guild.me.edit(deafen=False, mute=False, reason="Voice recording started")
         vc.start_recording(
             sink,
