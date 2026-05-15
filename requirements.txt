@@ -1,2 +1,2 @@
-discord.py[voice]
-discord-ext-voice-recv
+discord.py[voice]==2.6.4
+discord-ext-voice-recv==0.5.2a179

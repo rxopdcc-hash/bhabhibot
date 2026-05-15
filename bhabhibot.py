@@ -964,6 +964,8 @@ async def on_presence_update(before, after):
 
 @bot.event
 async def on_ready():
+    print(f"discord.py version: {discord.__version__}")
+
     if ensure_opus_loaded():
         print("Opus loaded for voice recording")
     else:
