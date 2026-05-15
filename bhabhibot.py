@@ -19,6 +19,23 @@ try:
 except Exception:
     voice_recv = None
 
+if voice_recv is not None:
+    try:
+        from discord.ext.voice_recv import opus as voice_recv_opus
+
+        _original_decode_packet = voice_recv_opus.PacketDecoder._decode_packet
+
+        def _decode_packet_skip_corrupt(self, packet):
+            try:
+                return _original_decode_packet(self, packet)
+            except discord.opus.OpusError:
+                self.reset()
+                return packet, b""
+
+        voice_recv_opus.PacketDecoder._decode_packet = _decode_packet_skip_corrupt
+    except Exception:
+        pass
+
 TOKEN = os.getenv("TOKEN")
 PREFIX = "."
 DATA_FILE = "/app/data/triggers.json"
@@ -549,6 +566,13 @@ async def record(ctx):
         )
 
     voice_channel = ctx.author.voice.channel
+    permissions = voice_channel.permissions_for(ctx.guild.me)
+
+    if not permissions.connect:
+        return await ctx.reply(embed=bot_missing_perm_embed(ctx, "connect"), mention_author=False)
+
+    if not permissions.speak:
+        return await ctx.reply(embed=bot_missing_perm_embed(ctx, "speak"), mention_author=False)
 
     if ctx.voice_client:
         await ctx.voice_client.disconnect(force=True)
@@ -561,8 +585,11 @@ async def record(ctx):
     try:
         vc = await voice_channel.connect(
             cls=voice_recv.VoiceRecvClient,
-            self_deaf=False
+            self_deaf=False,
+            self_mute=False
         )
+        await ctx.guild.me.edit(deafen=False, mute=False, reason="Voice recording started")
+        await asyncio.sleep(0.5)
         vc.listen(sink)
     except Exception as e:
         try:
