@@ -8,7 +8,6 @@ import logging
 import os
 import subprocess
 import shutil
-import traceback
 from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -49,6 +48,25 @@ DEFAULT_RECORDING = {
 }
 
 ACTIVE_RECORDINGS = {}
+
+
+def cleanup_recording_paths(state):
+    if not state:
+        return
+
+    output_path = Path(state["output_path"])
+    folder = Path(state["folder"])
+
+    try:
+        if output_path.exists():
+            output_path.unlink()
+    except Exception:
+        pass
+
+    try:
+        shutil.rmtree(folder)
+    except Exception:
+        pass
 
 
 def ensure_opus_loaded():
@@ -377,6 +395,29 @@ def mix_tracks_to_wav(input_paths, output_path):
     subprocess.run(command, check=True)
 
 
+async def start_recording_when_ready(vc, sink, ctx):
+    last_error = None
+
+    for _ in range(10):
+        try:
+            vc.start_recording(
+                sink,
+                pycord_recording_done,
+                ctx,
+                sync_start=True
+            )
+            return True
+        except Exception as e:
+            last_error = e
+
+            if e.__class__.__name__ != "RecordingException":
+                raise
+
+            await asyncio.sleep(0.5)
+
+    raise last_error
+
+
 async def pycord_recording_done(sink, ctx):
     state = ACTIVE_RECORDINGS.pop(ctx.guild.id, None) if ctx.guild else None
 
@@ -419,7 +460,7 @@ async def pycord_recording_done(sink, ctx):
     except subprocess.CalledProcessError:
         await ctx.reply(embed=warning_embed(ctx, "Could not mix recording tracks with ffmpeg."), mention_author=False)
     except Exception as e:
-        traceback.print_exc()
+        print(f"Recording failed: {type(e).__name__}: {e}", flush=True)
         await ctx.reply(embed=warning_embed(ctx, f"Recording failed: `{type(e).__name__}`"), mention_author=False)
     finally:
         try:
@@ -428,16 +469,7 @@ async def pycord_recording_done(sink, ctx):
         except Exception:
             pass
 
-        try:
-            if output_path.exists():
-                output_path.unlink()
-        except Exception:
-            pass
-
-        try:
-            shutil.rmtree(folder)
-        except Exception:
-            pass
+        cleanup_recording_paths(state)
 
 
 @bot.command(aliases=["setrecordchannel", "recchannel"])
@@ -531,27 +563,6 @@ async def record(ctx):
     folder.mkdir(parents=True, exist_ok=True)
     sink = discord.sinks.WaveSink()
 
-    try:
-        vc = await voice_channel.connect()
-        vc.start_recording(
-            sink,
-            pycord_recording_done,
-            ctx,
-            sync_start=True
-        )
-    except Exception as e:
-        traceback.print_exc()
-
-        try:
-            shutil.rmtree(folder)
-        except Exception:
-            pass
-
-        return await ctx.reply(
-            embed=warning_embed(ctx, f"Could not start voice recording: `{type(e).__name__}`"),
-            mention_author=False
-        )
-
     ACTIVE_RECORDINGS[ctx.guild.id] = {
         "folder": folder,
         "output_path": output_path,
@@ -559,6 +570,30 @@ async def record(ctx):
         "upload_channel_id": upload_channel.id,
         "started_by": ctx.author.id
     }
+
+    try:
+        vc = await voice_channel.connect()
+        await start_recording_when_ready(vc, sink, ctx)
+    except Exception as e:
+        print(f"Could not start voice recording: {type(e).__name__}: {e}", flush=True)
+
+        ACTIVE_RECORDINGS.pop(ctx.guild.id, None)
+
+        try:
+            if ctx.voice_client:
+                await ctx.voice_client.disconnect(force=True)
+        except Exception:
+            pass
+
+        cleanup_recording_paths({
+            "folder": folder,
+            "output_path": output_path
+        })
+
+        return await ctx.reply(
+            embed=warning_embed(ctx, f"Could not start voice recording: `{type(e).__name__}`"),
+            mention_author=False
+        )
 
     print(f"Recording started in guild={ctx.guild.id}, channel={voice_channel.id}", flush=True)
 
@@ -595,7 +630,16 @@ async def stoprecord(ctx):
     try:
         vc.stop_recording()
     except Exception as e:
-        traceback.print_exc()
+        print(f"Could not stop recording: {type(e).__name__}: {e}", flush=True)
+
+        ACTIVE_RECORDINGS.pop(ctx.guild.id, None)
+        cleanup_recording_paths(state)
+
+        try:
+            if ctx.voice_client:
+                await ctx.voice_client.disconnect(force=True)
+        except Exception:
+            pass
 
         return await ctx.reply(
             embed=warning_embed(ctx, f"Could not stop recording: `{type(e).__name__}`"),
