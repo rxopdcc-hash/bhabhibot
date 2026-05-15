@@ -1,16 +1,8 @@
 import discord
 from discord.ext import commands
-import asyncio
-import ctypes.util
-import glob
 import json
-import logging
 import os
-import subprocess
-import shutil
 from datetime import timedelta
-from pathlib import Path
-from uuid import uuid4
 
 TOKEN = os.getenv("TOKEN")
 PREFIX = "."
@@ -43,68 +35,6 @@ DEFAULT_TRIGGERS = {
     "mute": []
 }
 
-DEFAULT_RECORDING = {
-    "channel_id": None
-}
-
-ACTIVE_RECORDINGS = {}
-
-
-def cleanup_recording_paths(state):
-    if not state:
-        return
-
-    output_path = Path(state["output_path"])
-    folder = Path(state["folder"])
-
-    try:
-        if output_path.exists():
-            output_path.unlink()
-    except Exception:
-        pass
-
-    try:
-        shutil.rmtree(folder)
-    except Exception:
-        pass
-
-
-def ensure_opus_loaded():
-    if discord.opus.is_loaded():
-        return True
-
-    library_paths = []
-
-    for env_name in ["LD_LIBRARY_PATH", "LIBRARY_PATH"]:
-        for folder in os.getenv(env_name, "").split(os.pathsep):
-            if folder:
-                library_paths.extend(glob.glob(os.path.join(folder, "libopus.so*")))
-
-    library_paths.extend(glob.glob("/usr/lib/**/libopus.so*", recursive=True))
-    library_paths.extend(glob.glob("/lib/**/libopus.so*", recursive=True))
-    library_paths.extend(glob.glob("/nix/store/**/lib/libopus.so*", recursive=True))
-
-    names = [
-        ctypes.util.find_library("opus"),
-        *library_paths,
-        "libopus.so.0",
-        "libopus.so",
-        "opus",
-    ]
-
-    for name in names:
-        if not name:
-            continue
-
-        try:
-            discord.opus.load_opus(name)
-            return discord.opus.is_loaded()
-        except Exception:
-            pass
-
-    return False
-
-
 def load_data():
     if not os.path.exists(DATA_FILE):
         return {}
@@ -116,7 +46,6 @@ def load_data():
         data[gid].pop("timeout", None)
         for key in DEFAULT_TRIGGERS:
             data[gid].setdefault(key, [])
-        data[gid].setdefault("recording", DEFAULT_RECORDING.copy())
 
     return data
 
@@ -137,8 +66,7 @@ def setup_guild(guild_id):
             "ban": [],
             "kick": [],
             "mute": [],
-            "vanity": DEFAULT_VANITY.copy(),
-            "recording": DEFAULT_RECORDING.copy()
+            "vanity": DEFAULT_VANITY.copy()
         }
 
         save_data()
@@ -149,7 +77,6 @@ def setup_guild(guild_id):
         TRIGGERS[gid].setdefault(key, [])
 
     TRIGGERS[gid].setdefault("vanity", DEFAULT_VANITY.copy())
-    TRIGGERS[gid].setdefault("recording", DEFAULT_RECORDING.copy())
 
     return gid
 
@@ -363,301 +290,6 @@ async def unban(ctx, user_id: int = None):
     user = await bot.fetch_user(user_id)
     await ctx.guild.unban(user, reason=f"{ctx.author} unbanned user")
     await ctx.reply(embed=premium_embed(ctx, "unbanned", f"**{user}** has been unbanned."), mention_author=False)
-
-
-def recording_dir():
-    base = Path(DATA_FILE).parent
-    path = base / "recordings"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def mix_tracks_to_wav(input_paths, output_path):
-    if len(input_paths) == 1:
-        shutil.copyfile(input_paths[0], output_path)
-        return
-
-    command = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
-
-    for input_path in input_paths:
-        command.extend(["-i", str(input_path)])
-
-    command.extend([
-        "-filter_complex",
-        f"amix=inputs={len(input_paths)}:duration=longest:normalize=1",
-        "-ar",
-        "48000",
-        "-ac",
-        "2",
-        str(output_path)
-    ])
-
-    subprocess.run(command, check=True)
-
-
-async def start_recording_when_ready(vc, sink, ctx):
-    last_error = None
-
-    for _ in range(20):
-        active_vc = ctx.guild.voice_client or vc
-
-        if not active_vc.is_connected():
-            ws_ready = getattr(active_vc, "ws", None) is not None
-            socket_ready = getattr(active_vc, "socket", None) is not None
-
-            if ws_ready and socket_ready and hasattr(active_vc, "_connected"):
-                active_vc._connected.set()
-
-        try:
-            active_vc.start_recording(
-                sink,
-                pycord_recording_done,
-                ctx,
-                sync_start=True
-            )
-            return True
-        except Exception as e:
-            last_error = e
-
-            if e.__class__.__name__ != "RecordingException":
-                raise
-
-            await asyncio.sleep(1)
-
-    raise last_error
-
-
-async def pycord_recording_done(sink, ctx):
-    state = ACTIVE_RECORDINGS.pop(ctx.guild.id, None) if ctx.guild else None
-
-    if state is None:
-        return
-
-    folder = Path(state["folder"])
-    output_path = Path(state["output_path"])
-    upload_channel = ctx.guild.get_channel(state["upload_channel_id"]) if ctx.guild else None
-
-    try:
-        if upload_channel is None:
-            return await ctx.reply(embed=warning_embed(ctx, "Upload channel was deleted or not found."), mention_author=False)
-
-        files = []
-
-        for user_id, audio in sink.audio_data.items():
-            file_path = folder / f"track-{user_id}.wav"
-            audio.file.seek(0)
-
-            with open(file_path, "wb") as f:
-                shutil.copyfileobj(audio.file, f)
-
-            if file_path.exists() and file_path.stat().st_size > 1024:
-                files.append(file_path)
-
-        print(f"Pycord recording stopped: sources={len(sink.audio_data)}, files={len(files)}", flush=True)
-
-        if not files:
-            return await ctx.reply(embed=warning_embed(ctx, "Recording had no usable audio."), mention_author=False)
-
-        mix_tracks_to_wav(files, output_path)
-
-        await upload_channel.send(
-            content=f"Recording from **{ctx.guild.name}** stopped by {ctx.author.mention}.",
-            file=discord.File(str(output_path), filename=output_path.name)
-        )
-    except discord.HTTPException:
-        await ctx.reply(embed=warning_embed(ctx, "Recording file is too large for Discord upload."), mention_author=False)
-    except subprocess.CalledProcessError:
-        await ctx.reply(embed=warning_embed(ctx, "Could not mix recording tracks with ffmpeg."), mention_author=False)
-    except Exception as e:
-        print(f"Recording failed: {type(e).__name__}: {e}", flush=True)
-        await ctx.reply(embed=warning_embed(ctx, f"Recording failed: `{type(e).__name__}`"), mention_author=False)
-    finally:
-        try:
-            if ctx.voice_client:
-                await ctx.voice_client.disconnect(force=True)
-        except Exception:
-            pass
-
-        cleanup_recording_paths(state)
-
-
-@bot.command(aliases=["setrecordchannel", "recchannel"])
-async def recordchannel(ctx, channel: discord.TextChannel = None):
-    if not ctx.author.guild_permissions.manage_guild:
-        return await ctx.reply(embed=missing_perm_embed(ctx, "manage_server"), mention_author=False)
-
-    if channel is None:
-        return await ctx.reply(
-            embed=premium_embed(ctx, "recordchannel", "Set the channel where recordings are sent", ".recordchannel (channel)", ".recordchannel #admin"),
-            mention_author=False
-        )
-
-    gid = setup_guild(ctx.guild.id)
-    TRIGGERS[gid]["recording"]["channel_id"] = channel.id
-    save_data()
-
-    await ctx.reply(
-        embed=premium_embed(ctx, "recording channel updated", f"Recordings will be sent to {channel.mention}."),
-        mention_author=False
-    )
-
-
-@bot.command(aliases=["recsettings"])
-async def recordsettings(ctx):
-    if not ctx.author.guild_permissions.manage_guild:
-        return await ctx.reply(embed=missing_perm_embed(ctx, "manage_server"), mention_author=False)
-
-    gid = setup_guild(ctx.guild.id)
-    channel_id = TRIGGERS[gid]["recording"].get("channel_id")
-    channel = ctx.guild.get_channel(channel_id) if channel_id else None
-    status = "recording" if ctx.guild.id in ACTIVE_RECORDINGS else "not recording"
-
-    text = (
-        f"**upload channel**: {channel.mention if channel else '`not set`'}\n"
-        f"**status**: `{status}`\n"
-        f"**format**: `wav, 48khz stereo`"
-    )
-
-    await ctx.reply(embed=premium_embed(ctx, "recording settings", text), mention_author=False)
-
-
-@bot.command(aliases=["rec"])
-async def record(ctx):
-    if not ctx.author.guild_permissions.manage_guild:
-        return await ctx.reply(embed=missing_perm_embed(ctx, "manage_server"), mention_author=False)
-
-    if not hasattr(discord, "sinks") or not hasattr(discord.sinks, "WaveSink"):
-        return await ctx.reply(
-            embed=warning_embed(ctx, "Pycord voice recording is not available. Check `py-cord[voice]` install."),
-            mention_author=False
-        )
-
-    if not ensure_opus_loaded():
-        return await ctx.reply(
-            embed=warning_embed(ctx, "Opus audio library is not loaded on the host."),
-            mention_author=False
-        )
-
-    if not ctx.author.voice or not ctx.author.voice.channel:
-        return await ctx.reply(embed=warning_embed(ctx, "Join a voice channel first."), mention_author=False)
-
-    if ctx.guild.id in ACTIVE_RECORDINGS:
-        return await ctx.reply(embed=warning_embed(ctx, "A recording is already running."), mention_author=False)
-
-    gid = setup_guild(ctx.guild.id)
-    channel_id = TRIGGERS[gid]["recording"].get("channel_id")
-    upload_channel = ctx.guild.get_channel(channel_id) if channel_id else None
-
-    if upload_channel is None:
-        return await ctx.reply(
-            embed=warning_embed(ctx, "Set an upload channel first with `.recordchannel #channel`."),
-            mention_author=False
-        )
-
-    voice_channel = ctx.author.voice.channel
-    permissions = voice_channel.permissions_for(ctx.guild.me)
-
-    if not permissions.connect:
-        return await ctx.reply(embed=bot_missing_perm_embed(ctx, "connect"), mention_author=False)
-
-    if not permissions.speak:
-        return await ctx.reply(embed=bot_missing_perm_embed(ctx, "speak"), mention_author=False)
-
-    if ctx.voice_client:
-        await ctx.voice_client.disconnect(force=True)
-
-    session_id = f"recording-{ctx.guild.id}-{uuid4().hex}"
-    folder = recording_dir() / session_id
-    output_path = recording_dir() / f"{session_id}.wav"
-    folder.mkdir(parents=True, exist_ok=True)
-    sink = discord.sinks.WaveSink()
-
-    ACTIVE_RECORDINGS[ctx.guild.id] = {
-        "folder": folder,
-        "output_path": output_path,
-        "voice_channel_id": voice_channel.id,
-        "upload_channel_id": upload_channel.id,
-        "started_by": ctx.author.id
-    }
-
-    try:
-        vc = await voice_channel.connect()
-        await ctx.guild.change_voice_state(channel=voice_channel, self_mute=False, self_deaf=False)
-        await asyncio.sleep(1)
-        await start_recording_when_ready(vc, sink, ctx)
-    except Exception as e:
-        print(f"Could not start voice recording: {type(e).__name__}: {e}", flush=True)
-
-        ACTIVE_RECORDINGS.pop(ctx.guild.id, None)
-
-        try:
-            if ctx.voice_client:
-                await ctx.voice_client.disconnect(force=True)
-        except Exception:
-            pass
-
-        cleanup_recording_paths({
-            "folder": folder,
-            "output_path": output_path
-        })
-
-        return await ctx.reply(
-            embed=warning_embed(ctx, f"Could not start voice recording: `{type(e).__name__}`"),
-            mention_author=False
-        )
-
-    print(f"Recording started in guild={ctx.guild.id}, channel={voice_channel.id}", flush=True)
-
-    await ctx.reply(
-        embed=premium_embed(
-            ctx,
-            "recording started",
-            f"Now recording {voice_channel.mention}.\nEveryone in the voice channel should know this is being recorded."
-        ),
-        mention_author=False
-    )
-
-
-@bot.command(aliases=["stoprec", "stoprecording"])
-async def stoprecord(ctx):
-    if not ctx.author.guild_permissions.manage_guild:
-        return await ctx.reply(embed=missing_perm_embed(ctx, "manage_server"), mention_author=False)
-
-    state = ACTIVE_RECORDINGS.get(ctx.guild.id)
-
-    if state is None:
-        return await ctx.reply(embed=warning_embed(ctx, "No recording is running."), mention_author=False)
-
-    upload_channel = ctx.guild.get_channel(state["upload_channel_id"])
-
-    if upload_channel is None:
-        return await ctx.reply(embed=warning_embed(ctx, "Upload channel was deleted or not found."), mention_author=False)
-
-    vc = ctx.voice_client
-
-    if not vc:
-        return await ctx.reply(embed=warning_embed(ctx, "Voice client was not found."), mention_author=False)
-
-    try:
-        vc.stop_recording()
-    except Exception as e:
-        print(f"Could not stop recording: {type(e).__name__}: {e}", flush=True)
-
-        ACTIVE_RECORDINGS.pop(ctx.guild.id, None)
-        cleanup_recording_paths(state)
-
-        try:
-            if ctx.voice_client:
-                await ctx.voice_client.disconnect(force=True)
-        except Exception:
-            pass
-
-        return await ctx.reply(
-            embed=warning_embed(ctx, f"Could not stop recording: `{type(e).__name__}`"),
-            mention_author=False
-        )
-
-    await ctx.reply(embed=premium_embed(ctx, "recording stopped", f"Processing and sending recording to {upload_channel.mention}."), mention_author=False)
 
 
 @bot.command()
@@ -1114,20 +746,7 @@ async def on_presence_update(before, after):
 
 @bot.event
 async def on_ready():
-    print(f"discord library version: {discord.__version__}", flush=True)
-
-    try:
-        import davey
-        print(f"davey loaded: {getattr(davey, '__version__', 'installed')}", flush=True)
-    except Exception:
-        print("davey not loaded; Discord DAVE voice may sound corrupted", flush=True)
-
-    if ensure_opus_loaded():
-        print("Opus loaded for voice recording", flush=True)
-    else:
-        print("Opus not loaded; voice recording will not work", flush=True)
-
-    print(f"Logged in as {bot.user}", flush=True)
+    print(f"Logged in as {bot.user}")
 
 
 bot.run(TOKEN)
