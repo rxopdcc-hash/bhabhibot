@@ -533,7 +533,6 @@ async def record(ctx):
 
     try:
         vc = await voice_channel.connect()
-        await ctx.guild.me.edit(deafen=False, mute=False, reason="Voice recording started")
         vc.start_recording(
             sink,
             pycord_recording_done,
