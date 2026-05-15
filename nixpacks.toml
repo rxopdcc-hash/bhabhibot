@@ -1,3 +1,4 @@
 [phases.setup]
 nixPkgs = ["...", "ffmpeg", "opus"]
 nixLibs = ["...", "opus"]
+aptPkgs = ["...", "libopus0", "libopus-dev"]

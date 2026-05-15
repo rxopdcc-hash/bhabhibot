@@ -1,5 +1,6 @@
 import discord
 from discord.ext import commands
+import ctypes.util
 import json
 import os
 from datetime import timedelta
@@ -47,6 +48,30 @@ DEFAULT_RECORDING = {
 }
 
 ACTIVE_RECORDINGS = {}
+
+
+def ensure_opus_loaded():
+    if discord.opus.is_loaded():
+        return True
+
+    names = [
+        ctypes.util.find_library("opus"),
+        "libopus.so.0",
+        "libopus.so",
+        "opus",
+    ]
+
+    for name in names:
+        if not name:
+            continue
+
+        try:
+            discord.opus.load_opus(name)
+            return discord.opus.is_loaded()
+        except Exception:
+            pass
+
+    return False
 
 
 def load_data():
@@ -364,6 +389,12 @@ async def record(ctx):
     if voice_recv is None:
         return await ctx.reply(
             embed=warning_embed(ctx, "Install `discord-ext-voice-recv` and `PyNaCl` first."),
+            mention_author=False
+        )
+
+    if not ensure_opus_loaded():
+        return await ctx.reply(
+            embed=warning_embed(ctx, "Opus audio library is not loaded on the host."),
             mention_author=False
         )
 
@@ -920,6 +951,11 @@ async def on_presence_update(before, after):
 
 @bot.event
 async def on_ready():
+    if ensure_opus_loaded():
+        print("Opus loaded for voice recording")
+    else:
+        print("Opus not loaded; voice recording will not work")
+
     print(f"Logged in as {bot.user}")
 
 
