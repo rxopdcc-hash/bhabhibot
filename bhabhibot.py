@@ -1,5 +1,6 @@
 import discord
 from discord.ext import commands, tasks
+import asyncio
 import json
 import os
 import re
@@ -21,6 +22,7 @@ bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
 MENTION_RE = re.compile(r"<@!?(\d+)>")
 REP_STATES = {}
+REP_LOCKS = {}
 
 DEFAULT_VANITY = {
     "enabled": False,
@@ -993,49 +995,54 @@ async def update_rep_role(member, config, matched, add_reason, remove_reason):
         return
 
     state_key = (member.guild.id, member.id, role.id)
-    previous_state = REP_STATES.get(state_key)
+    lock = REP_LOCKS.setdefault(state_key, asyncio.Lock())
 
-    if previous_state == matched:
-        return
+    async with lock:
+        previous_state = REP_STATES.get(state_key)
 
-    has_role = role in member.roles
-    channel = member.guild.get_channel(channel_id) if channel_id else None
+        if previous_state == matched:
+            return
 
-    if matched and not has_role:
-        try:
-            await member.add_roles(role, reason=add_reason)
+        has_role = role in member.roles
+        channel = member.guild.get_channel(channel_id) if channel_id else None
+
+        if matched and not has_role:
             REP_STATES[state_key] = True
 
-            if channel:
-                embed = discord.Embed(
-                    description=format_rep_message(config["message"], member, role),
-                    color=int(config["color"], 16)
-                )
-                await channel.send(embed=embed)
+            try:
+                await member.add_roles(role, reason=add_reason)
 
-        except:
-            pass
+                if channel:
+                    embed = discord.Embed(
+                        description=format_rep_message(config["message"], member, role),
+                        color=int(config["color"], 16)
+                    )
+                    await channel.send(embed=embed)
 
-    elif matched:
-        REP_STATES[state_key] = True
+            except:
+                REP_STATES.pop(state_key, None)
 
-    elif not matched and has_role:
-        try:
-            await member.remove_roles(role, reason=remove_reason)
+        elif matched:
+            REP_STATES[state_key] = True
+
+        elif not matched and has_role:
             REP_STATES[state_key] = False
 
-            if channel:
-                embed = discord.Embed(
-                    description=format_rep_message(config["remove_message"], member, role),
-                    color=int(config["remove_color"], 16)
-                )
-                await channel.send(embed=embed)
+            try:
+                await member.remove_roles(role, reason=remove_reason)
 
-        except:
-            pass
+                if channel:
+                    embed = discord.Embed(
+                        description=format_rep_message(config["remove_message"], member, role),
+                        color=int(config["remove_color"], 16)
+                    )
+                    await channel.send(embed=embed)
 
-    else:
-        REP_STATES[state_key] = False
+            except:
+                REP_STATES[state_key] = True
+
+        else:
+            REP_STATES[state_key] = False
 
 
 def primary_value(primary_guild, key):
