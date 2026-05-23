@@ -20,6 +20,7 @@ intents.presences = True
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
 MENTION_RE = re.compile(r"<@!?(\d+)>")
+REP_STATES = {}
 
 DEFAULT_VANITY = {
     "enabled": False,
@@ -991,12 +992,19 @@ async def update_rep_role(member, config, matched, add_reason, remove_reason):
     if not role:
         return
 
+    state_key = (member.guild.id, member.id, role.id)
+    previous_state = REP_STATES.get(state_key)
+
+    if previous_state == matched:
+        return
+
     has_role = role in member.roles
     channel = member.guild.get_channel(channel_id) if channel_id else None
 
     if matched and not has_role:
         try:
             await member.add_roles(role, reason=add_reason)
+            REP_STATES[state_key] = True
 
             if channel:
                 embed = discord.Embed(
@@ -1008,9 +1016,13 @@ async def update_rep_role(member, config, matched, add_reason, remove_reason):
         except:
             pass
 
+    elif matched:
+        REP_STATES[state_key] = True
+
     elif not matched and has_role:
         try:
             await member.remove_roles(role, reason=remove_reason)
+            REP_STATES[state_key] = False
 
             if channel:
                 embed = discord.Embed(
@@ -1021,6 +1033,9 @@ async def update_rep_role(member, config, matched, add_reason, remove_reason):
 
         except:
             pass
+
+    else:
+        REP_STATES[state_key] = False
 
 
 def primary_value(primary_guild, key):
@@ -1232,6 +1247,26 @@ async def on_socket_response(payload):
             await process_tag_member(member, primary_guild=primary_guild)
 
 
+def seed_rep_states():
+    for guild in bot.guilds:
+        gid = setup_guild(guild.id)
+
+        for config_key in ("vanity", "tag"):
+            config = TRIGGERS[gid].get(config_key, {})
+            role_id = config.get("role_id")
+
+            if not role_id:
+                continue
+
+            role = guild.get_role(role_id)
+
+            if not role:
+                continue
+
+            for member in guild.members:
+                REP_STATES[(guild.id, member.id, role.id)] = role in member.roles
+
+
 @tasks.loop(minutes=5)
 async def tag_scan():
     for guild in bot.guilds:
@@ -1253,6 +1288,8 @@ async def tag_scan():
 
 @bot.event
 async def on_ready():
+    seed_rep_states()
+
     if not tag_scan.is_running():
         tag_scan.start()
 
