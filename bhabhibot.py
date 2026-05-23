@@ -1,7 +1,8 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import json
 import os
+import re
 from datetime import timedelta
 
 TOKEN = os.getenv("TOKEN")
@@ -18,6 +19,8 @@ intents.presences = True
 
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
+MENTION_RE = re.compile(r"<@!?(\d+)>")
+
 DEFAULT_VANITY = {
     "enabled": False,
     "role_id": None,
@@ -29,11 +32,28 @@ DEFAULT_VANITY = {
     "remove_message": "{user} is no longer repping the server."
 }
 
+DEFAULT_TAG = {
+    "enabled": False,
+    "role_id": None,
+    "channel_id": None,
+    "triggers": [],
+    "message": "{user} is repping the server tag now.",
+    "color": "57F287",
+    "remove_color": "ED4245",
+    "remove_message": "{user} is no longer repping the server tag."
+}
+
 DEFAULT_TRIGGERS = {
     "ban": [],
     "kick": [],
     "mute": []
 }
+
+
+def fresh_config(default):
+    data = default.copy()
+    data["triggers"] = default["triggers"].copy()
+    return data
 
 def load_data():
     if not os.path.exists(DATA_FILE):
@@ -46,6 +66,12 @@ def load_data():
         data[gid].pop("timeout", None)
         for key in DEFAULT_TRIGGERS:
             data[gid].setdefault(key, [])
+        data[gid].setdefault("vanity", fresh_config(DEFAULT_VANITY))
+        data[gid].setdefault("tag", fresh_config(DEFAULT_TAG))
+        for key, value in DEFAULT_VANITY.items():
+            data[gid]["vanity"].setdefault(key, value.copy() if isinstance(value, list) else value)
+        for key, value in DEFAULT_TAG.items():
+            data[gid]["tag"].setdefault(key, value.copy() if isinstance(value, list) else value)
 
     return data
 
@@ -66,7 +92,8 @@ def setup_guild(guild_id):
             "ban": [],
             "kick": [],
             "mute": [],
-            "vanity": DEFAULT_VANITY.copy()
+            "vanity": fresh_config(DEFAULT_VANITY),
+            "tag": fresh_config(DEFAULT_TAG)
         }
 
         save_data()
@@ -76,7 +103,14 @@ def setup_guild(guild_id):
     for key in DEFAULT_TRIGGERS:
         TRIGGERS[gid].setdefault(key, [])
 
-    TRIGGERS[gid].setdefault("vanity", DEFAULT_VANITY.copy())
+    TRIGGERS[gid].setdefault("vanity", fresh_config(DEFAULT_VANITY))
+    TRIGGERS[gid].setdefault("tag", fresh_config(DEFAULT_TAG))
+
+    for key, value in DEFAULT_VANITY.items():
+        TRIGGERS[gid]["vanity"].setdefault(key, value.copy() if isinstance(value, list) else value)
+
+    for key, value in DEFAULT_TAG.items():
+        TRIGGERS[gid]["tag"].setdefault(key, value.copy() if isinstance(value, list) else value)
 
     return gid
 
@@ -610,6 +644,357 @@ async def list(ctx):
     )
 
 
+@bot.group(invoke_without_command=True)
+async def tag(ctx):
+    await ctx.reply(
+        embed=premium_embed(
+            ctx,
+            "tag",
+            ".tag setup system",
+            ".tag <subcommand>",
+            ".tag enable"
+        ),
+        mention_author=False
+    )
+
+
+@tag.command(name="enable")
+async def tag_enable(ctx):
+    gid = setup_guild(ctx.guild.id)
+
+    TRIGGERS[gid]["tag"]["enabled"] = True
+    save_data()
+
+    await ctx.reply(
+        embed=premium_embed(ctx, "tag enabled", "Server tag system is now enabled."),
+        mention_author=False
+    )
+
+
+@tag.command(name="disable")
+async def tag_disable(ctx):
+    gid = setup_guild(ctx.guild.id)
+
+    TRIGGERS[gid]["tag"]["enabled"] = False
+    save_data()
+
+    await ctx.reply(
+        embed=premium_embed(ctx, "tag disabled", "Server tag system is now disabled."),
+        mention_author=False
+    )
+
+
+@tag.command(name="role")
+async def tag_role(ctx, role: discord.Role = None):
+    if role is None:
+        return await ctx.reply(
+            embed=warning_embed(ctx, "Provide a role."),
+            mention_author=False
+        )
+
+    gid = setup_guild(ctx.guild.id)
+
+    TRIGGERS[gid]["tag"]["role_id"] = role.id
+    save_data()
+
+    await ctx.reply(
+        embed=premium_embed(ctx, "role updated", f"Tag role set to {role.mention}."),
+        mention_author=False
+    )
+
+
+@tag.command(name="channel")
+async def tag_channel(ctx, channel: discord.TextChannel = None):
+    if channel is None:
+        return await ctx.reply(
+            embed=warning_embed(ctx, "Provide a channel."),
+            mention_author=False
+        )
+
+    gid = setup_guild(ctx.guild.id)
+
+    TRIGGERS[gid]["tag"]["channel_id"] = channel.id
+    save_data()
+
+    await ctx.reply(
+        embed=premium_embed(ctx, "channel updated", f"Tag channel set to {channel.mention}."),
+        mention_author=False
+    )
+
+
+@tag.command(name="add")
+async def tag_add(ctx, *, trigger=None):
+    if not trigger:
+        return await ctx.reply(
+            embed=warning_embed(ctx, "Provide a server tag."),
+            mention_author=False
+        )
+
+    gid = setup_guild(ctx.guild.id)
+    trigger = trigger.lower().replace("#", "").strip()
+
+    if trigger in TRIGGERS[gid]["tag"]["triggers"]:
+        return await ctx.reply(
+            embed=warning_embed(ctx, "That tag already exists."),
+            mention_author=False
+        )
+
+    TRIGGERS[gid]["tag"]["triggers"].append(trigger)
+    save_data()
+
+    await ctx.reply(
+        embed=premium_embed(ctx, "tag added", f"`{trigger}` added."),
+        mention_author=False
+    )
+
+
+@tag.command(name="remove")
+async def tag_remove(ctx, *, trigger=None):
+    if not trigger:
+        return await ctx.reply(
+            embed=warning_embed(ctx, "Provide a server tag."),
+            mention_author=False
+        )
+
+    gid = setup_guild(ctx.guild.id)
+    trigger = trigger.lower().replace("#", "").strip()
+
+    if trigger not in TRIGGERS[gid]["tag"]["triggers"]:
+        return await ctx.reply(
+            embed=warning_embed(ctx, "Tag not found."),
+            mention_author=False
+        )
+
+    TRIGGERS[gid]["tag"]["triggers"].remove(trigger)
+    save_data()
+
+    await ctx.reply(
+        embed=premium_embed(ctx, "tag removed", f"`{trigger}` removed."),
+        mention_author=False
+    )
+
+
+@tag.command(name="message")
+async def tag_message(ctx, *, message=None):
+    if not message:
+        return await ctx.reply(
+            embed=warning_embed(ctx, "Provide a message."),
+            mention_author=False
+        )
+
+    gid = setup_guild(ctx.guild.id)
+
+    TRIGGERS[gid]["tag"]["message"] = message
+    save_data()
+
+    await ctx.reply(
+        embed=premium_embed(ctx, "message updated", "Tag message updated."),
+        mention_author=False
+    )
+
+
+@tag.command(name="color")
+async def tag_color(ctx, color=None):
+    if not color:
+        return await ctx.reply(
+            embed=warning_embed(ctx, "Provide a hex color."),
+            mention_author=False
+        )
+
+    gid = setup_guild(ctx.guild.id)
+    color = color.replace("#", "")
+
+    TRIGGERS[gid]["tag"]["color"] = color
+    save_data()
+
+    await ctx.reply(
+        embed=premium_embed(ctx, "color updated", f"Color set to `{color}`."),
+        mention_author=False
+    )
+
+
+@tag.command(name="removecolor")
+async def tag_removecolor(ctx, color=None):
+    if not color:
+        return await ctx.reply(
+            embed=warning_embed(ctx, "Provide a hex color."),
+            mention_author=False
+        )
+
+    gid = setup_guild(ctx.guild.id)
+    color = color.replace("#", "")
+
+    TRIGGERS[gid]["tag"]["remove_color"] = color
+    save_data()
+
+    await ctx.reply(
+        embed=premium_embed(ctx, "remove color updated", f"Remove color set to `{color}`."),
+        mention_author=False
+    )
+
+
+@tag.command(name="removemessage")
+async def tag_removemessage(ctx, *, message=None):
+    if not message:
+        return await ctx.reply(
+            embed=warning_embed(ctx, "Provide a message."),
+            mention_author=False
+        )
+
+    gid = setup_guild(ctx.guild.id)
+
+    TRIGGERS[gid]["tag"]["remove_message"] = message
+    save_data()
+
+    await ctx.reply(
+        embed=premium_embed(ctx, "remove message updated", "Tag remove message updated."),
+        mention_author=False
+    )
+
+
+@tag.command(name="list")
+async def tag_list(ctx):
+    gid = setup_guild(ctx.guild.id)
+    tag_config = TRIGGERS[gid]["tag"]
+
+    triggers = tag_config["triggers"]
+    formatted = " ".join(f"`{t}`" for t in triggers) if triggers else "`current server tag`"
+
+    text = (
+        f"**enabled**: `{tag_config['enabled']}`\n"
+        f"**tags**: {formatted}"
+    )
+
+    await ctx.reply(
+        embed=premium_embed(ctx, "tag config", text),
+        mention_author=False
+    )
+
+
+def status_text_for(member):
+    status_text = ""
+
+    for activity in member.activities:
+        if isinstance(activity, discord.CustomActivity):
+            if activity.name:
+                status_text += f" {activity.name.lower()}"
+
+            if activity.state:
+                status_text += f" {activity.state.lower()}"
+
+    return status_text
+
+
+def format_rep_message(message, member, role):
+    msg = message.replace("{user}", member.mention)
+    msg = msg.replace("{server}", member.guild.name)
+    msg = msg.replace("{role}", role.mention)
+    return msg
+
+
+def explicit_mentioned_member(message):
+    match = MENTION_RE.search(message.content)
+
+    if not match:
+        return None
+
+    return message.guild.get_member(int(match.group(1)))
+
+
+async def update_rep_role(member, config, matched, add_reason, remove_reason):
+    role_id = config["role_id"]
+    channel_id = config["channel_id"]
+
+    if not role_id:
+        return
+
+    role = member.guild.get_role(role_id)
+
+    if not role:
+        return
+
+    has_role = role in member.roles
+    channel = member.guild.get_channel(channel_id) if channel_id else None
+
+    if matched and not has_role:
+        try:
+            await member.add_roles(role, reason=add_reason)
+
+            if channel:
+                embed = discord.Embed(
+                    description=format_rep_message(config["message"], member, role),
+                    color=int(config["color"], 16)
+                )
+                await channel.send(embed=embed)
+
+        except:
+            pass
+
+    elif not matched and has_role:
+        try:
+            await member.remove_roles(role, reason=remove_reason)
+
+            if channel:
+                embed = discord.Embed(
+                    description=format_rep_message(config["remove_message"], member, role),
+                    color=int(config["remove_color"], 16)
+                )
+                await channel.send(embed=embed)
+
+        except:
+            pass
+
+
+def primary_value(primary_guild, key):
+    if isinstance(primary_guild, dict):
+        return primary_guild.get(key)
+
+    return getattr(primary_guild, key, None)
+
+
+def member_has_server_tag(member, tag_config, user=None, primary_guild=None):
+    source = user or member
+    primary_guild = primary_guild or getattr(source, "primary_guild", None)
+
+    if not primary_guild:
+        return False
+
+    if primary_value(primary_guild, "identity_enabled") is not True:
+        return False
+
+    identity_guild_id = primary_value(primary_guild, "identity_guild_id")
+    tag_text = primary_value(primary_guild, "tag")
+
+    if identity_guild_id and int(identity_guild_id) == member.guild.id:
+        return True
+
+    configured_tags = tag_config["triggers"]
+
+    if tag_text and configured_tags:
+        return tag_text.lower() in configured_tags
+
+    return False
+
+
+async def process_tag_member(member, user=None, primary_guild=None):
+    if member.bot or not member.guild:
+        return
+
+    gid = setup_guild(member.guild.id)
+    tag_config = TRIGGERS[gid]["tag"]
+
+    if not tag_config["enabled"]:
+        return
+
+    await update_rep_role(
+        member,
+        tag_config,
+        member_has_server_tag(member, tag_config, user, primary_guild),
+        "Server tag detected",
+        "Server tag removed"
+    )
+
+
 @bot.event
 async def on_message(message):
     if message.author.bot or not message.guild:
@@ -632,20 +1017,29 @@ async def on_message(message):
         return
 
     trigger_name = parts[0].lower()
-    member = message.mentions[0] if message.mentions else None
+    member = explicit_mentioned_member(message)
 
     args = parts[1:]
     args = [a for a in args if not a.startswith("<@") and not a.startswith("<@!")]
 
     if trigger_name in TRIGGERS[gid]["ban"]:
+        if member is None:
+            return
+
         reason = " ".join(args) if args else "No reason provided"
         return await run_ban(ctx, member, reason=reason)
 
     if trigger_name in TRIGGERS[gid]["kick"]:
+        if member is None:
+            return
+
         reason = " ".join(args) if args else "No reason provided"
         return await run_kick(ctx, member, reason=reason)
 
     if trigger_name in TRIGGERS[gid]["mute"]:
+        if member is None:
+            return
+
         duration = args[0] if args else "10m"
         reason = " ".join(args[1:]) if len(args) > 1 else "No reason provided"
         return await run_mute(ctx, member, duration, reason=reason)
@@ -670,21 +1064,9 @@ async def on_presence_update(before, after):
         return
 
     gid = setup_guild(after.guild.id)
-
     vanity = TRIGGERS[gid]["vanity"]
 
     if not vanity["enabled"]:
-        return
-
-    role_id = vanity["role_id"]
-    channel_id = vanity["channel_id"]
-
-    if not role_id:
-        return
-
-    role = after.guild.get_role(role_id)
-
-    if not role:
         return
 
     triggers = vanity["triggers"]
@@ -692,60 +1074,84 @@ async def on_presence_update(before, after):
     if not triggers:
         return
 
-    status_text = ""
+    before_status_text = status_text_for(before)
+    after_status_text = status_text_for(after)
 
-    for activity in after.activities:
-        if isinstance(activity, discord.CustomActivity):
-            if activity.name:
-                status_text += f" {activity.name.lower()}"
+    before_matched = any(trigger in before_status_text for trigger in triggers)
+    after_matched = any(trigger in after_status_text for trigger in triggers)
+    went_offline = after.status == discord.Status.offline
 
-            if activity.state:
-                status_text += f" {activity.state.lower()}"
+    if after_matched:
+        return await update_rep_role(after, vanity, True, "Vanity detected", "Vanity removed")
 
-    matched = any(trigger in status_text for trigger in triggers)
+    if before_matched and not went_offline:
+        return await update_rep_role(after, vanity, False, "Vanity detected", "Vanity removed")
 
-    has_role = role in after.roles
 
-    channel = after.guild.get_channel(channel_id) if channel_id else None
+@bot.event
+async def on_member_update(before, after):
+    await process_tag_member(after)
 
-    if matched and not has_role:
-        try:
-            await after.add_roles(role, reason="Vanity detected")
 
-            if channel:
-                msg = vanity["message"]
+@bot.event
+async def on_user_update(before, after):
+    for guild in bot.guilds:
+        member = guild.get_member(after.id)
 
-                msg = msg.replace("{user}", after.mention)
-                msg = msg.replace("{server}", after.guild.name)
-                msg = msg.replace("{role}", role.mention)
+        if member:
+            await process_tag_member(member, after)
 
-                embed = discord.Embed(
-                    description=msg,
-                    color=int(vanity["color"], 16)
-                )
 
-                await channel.send(embed=embed)
+@bot.event
+async def on_member_join(member):
+    await process_tag_member(member)
 
-        except:
-            pass
 
-    elif not matched and has_role:
-        try:
-            await after.remove_roles(role, reason="Vanity removed")
+@bot.listen("on_socket_response")
+async def on_socket_response(payload):
+    if payload.get("t") != "GUILD_MEMBER_UPDATE":
+        return
 
-            if channel:
-                embed = discord.Embed(
-                    description=vanity["remove_message"].replace("{user}", after.mention),
-                    color=int(vanity["remove_color"], 16)
-                )
+    data = payload.get("d", {})
+    user_data = data.get("user", {})
+    primary_guild = user_data.get("primary_guild")
 
-                await channel.send(embed=embed)
+    if not primary_guild:
+        return
 
-        except:
-            pass
+    guild_id = data.get("guild_id")
+    user_id = user_data.get("id")
+
+    if not guild_id or not user_id:
+        return
+
+    guild = bot.get_guild(int(guild_id))
+
+    if not guild:
+        return
+
+    member = guild.get_member(int(user_id))
+
+    if member:
+        await process_tag_member(member, primary_guild=primary_guild)
+
+
+@tasks.loop(minutes=5)
+async def tag_scan():
+    for guild in bot.guilds:
+        gid = setup_guild(guild.id)
+
+        if not TRIGGERS[gid]["tag"]["enabled"]:
+            continue
+
+        for member in guild.members:
+            await process_tag_member(member)
 
 @bot.event
 async def on_ready():
+    if not tag_scan.is_running():
+        tag_scan.start()
+
     print(f"Logged in as {bot.user}")
 
 
