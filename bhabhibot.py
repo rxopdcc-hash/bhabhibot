@@ -55,6 +55,10 @@ def fresh_config(default):
     data["triggers"] = default["triggers"].copy()
     return data
 
+
+def copy_default_value(value):
+    return value.copy() if type(value) is list else value
+
 def load_data():
     if not os.path.exists(DATA_FILE):
         return {}
@@ -69,9 +73,9 @@ def load_data():
         data[gid].setdefault("vanity", fresh_config(DEFAULT_VANITY))
         data[gid].setdefault("tag", fresh_config(DEFAULT_TAG))
         for key, value in DEFAULT_VANITY.items():
-            data[gid]["vanity"].setdefault(key, value.copy() if isinstance(value, list) else value)
+            data[gid]["vanity"].setdefault(key, copy_default_value(value))
         for key, value in DEFAULT_TAG.items():
-            data[gid]["tag"].setdefault(key, value.copy() if isinstance(value, list) else value)
+            data[gid]["tag"].setdefault(key, copy_default_value(value))
 
     return data
 
@@ -107,10 +111,10 @@ def setup_guild(guild_id):
     TRIGGERS[gid].setdefault("tag", fresh_config(DEFAULT_TAG))
 
     for key, value in DEFAULT_VANITY.items():
-        TRIGGERS[gid]["vanity"].setdefault(key, value.copy() if isinstance(value, list) else value)
+        TRIGGERS[gid]["vanity"].setdefault(key, copy_default_value(value))
 
     for key, value in DEFAULT_TAG.items():
-        TRIGGERS[gid]["tag"].setdefault(key, value.copy() if isinstance(value, list) else value)
+        TRIGGERS[gid]["tag"].setdefault(key, copy_default_value(value))
 
     return gid
 
@@ -1023,23 +1027,14 @@ async def on_message(message):
     args = [a for a in args if not a.startswith("<@") and not a.startswith("<@!")]
 
     if trigger_name in TRIGGERS[gid]["ban"]:
-        if member is None:
-            return
-
         reason = " ".join(args) if args else "No reason provided"
         return await run_ban(ctx, member, reason=reason)
 
     if trigger_name in TRIGGERS[gid]["kick"]:
-        if member is None:
-            return
-
         reason = " ".join(args) if args else "No reason provided"
         return await run_kick(ctx, member, reason=reason)
 
     if trigger_name in TRIGGERS[gid]["mute"]:
-        if member is None:
-            return
-
         duration = args[0] if args else "10m"
         reason = " ".join(args[1:]) if len(args) > 1 else "No reason provided"
         return await run_mute(ctx, member, duration, reason=reason)
