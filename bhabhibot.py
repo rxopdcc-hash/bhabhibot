@@ -875,6 +875,80 @@ async def tag_list(ctx):
     )
 
 
+@tag.command(name="check")
+async def tag_check(ctx, member: discord.Member = None):
+    member = member or ctx.author
+    gid = setup_guild(ctx.guild.id)
+    tag_config = TRIGGERS[gid]["tag"]
+
+    try:
+        user = await bot.fetch_user(member.id)
+    except:
+        user = member
+
+    primary_guild = getattr(user, "primary_guild", None)
+    identity_guild_id = primary_first(primary_guild, "identity_guild_id", "guild_id", "id") if primary_guild else None
+    identity_enabled = primary_value(primary_guild, "identity_enabled") if primary_guild else None
+    tag_text = primary_value(primary_guild, "tag") if primary_guild else None
+    matched = member_has_server_tag(member, tag_config, user)
+
+    text = (
+        f"**member**: {member.mention}\n"
+        f"**detected**: `{matched}`\n"
+        f"**tag**: `{tag_text or 'none'}`\n"
+        f"**identity enabled**: `{identity_enabled}`\n"
+        f"**identity guild id**: `{identity_guild_id or 'none'}`"
+    )
+
+    if matched:
+        await process_tag_member(member, user)
+
+    await ctx.reply(
+        embed=premium_embed(ctx, "tag check", text),
+        mention_author=False
+    )
+
+
+@tag.command(name="sync", aliases=["give"])
+async def tag_sync(ctx):
+    if not ctx.author.guild_permissions.manage_guild:
+        return await ctx.reply(embed=missing_perm_embed(ctx, "manage_server"), mention_author=False)
+
+    gid = setup_guild(ctx.guild.id)
+    tag_config = TRIGGERS[gid]["tag"]
+
+    if not tag_config["enabled"]:
+        return await ctx.reply(embed=warning_embed(ctx, "Tag system is disabled."), mention_author=False)
+
+    updated = 0
+
+    async with ctx.typing():
+        for member in ctx.guild.members:
+            if member.bot:
+                continue
+
+            try:
+                user = await bot.fetch_user(member.id)
+            except:
+                user = member
+
+            had_role = False
+            role = ctx.guild.get_role(tag_config["role_id"]) if tag_config["role_id"] else None
+
+            if role:
+                had_role = role in member.roles
+
+            await process_tag_member(member, user)
+
+            if role and not had_role and role in member.roles:
+                updated += 1
+
+    await ctx.reply(
+        embed=premium_embed(ctx, "tag sync", f"Checked members and updated `{updated}` role(s)."),
+        mention_author=False
+    )
+
+
 def status_text_for(member):
     status_text = ""
 
@@ -956,6 +1030,16 @@ def primary_value(primary_guild, key):
     return getattr(primary_guild, key, None)
 
 
+def primary_first(primary_guild, *keys):
+    for key in keys:
+        value = primary_value(primary_guild, key)
+
+        if value is not None:
+            return value
+
+    return None
+
+
 def member_has_server_tag(member, tag_config, user=None, primary_guild=None):
     source = user or member
     primary_guild = primary_guild or getattr(source, "primary_guild", None)
@@ -966,7 +1050,7 @@ def member_has_server_tag(member, tag_config, user=None, primary_guild=None):
     if primary_value(primary_guild, "identity_enabled") is not True:
         return False
 
-    identity_guild_id = primary_value(primary_guild, "identity_guild_id")
+    identity_guild_id = primary_first(primary_guild, "identity_guild_id", "guild_id", "id")
     tag_text = primary_value(primary_guild, "tag")
 
     if identity_guild_id and int(identity_guild_id) == member.guild.id:
@@ -1003,6 +1087,8 @@ async def process_tag_member(member, user=None, primary_guild=None):
 async def on_message(message):
     if message.author.bot or not message.guild:
         return
+
+    await process_tag_member(message.author)
 
     if not message.content.startswith(PREFIX):
         return
@@ -1104,31 +1190,46 @@ async def on_member_join(member):
 
 @bot.listen("on_socket_response")
 async def on_socket_response(payload):
-    if payload.get("t") != "GUILD_MEMBER_UPDATE":
+    event_name = payload.get("t")
+
+    if event_name not in ("GUILD_MEMBER_UPDATE", "USER_UPDATE"):
         return
 
     data = payload.get("d", {})
-    user_data = data.get("user", {})
-    primary_guild = user_data.get("primary_guild")
+    user_data = data.get("user", data)
+    primary_guild = user_data.get("primary_guild") or data.get("primary_guild")
 
     if not primary_guild:
         return
 
-    guild_id = data.get("guild_id")
     user_id = user_data.get("id")
 
-    if not guild_id or not user_id:
+    if not user_id:
         return
 
-    guild = bot.get_guild(int(guild_id))
+    if event_name == "GUILD_MEMBER_UPDATE":
+        guild_id = data.get("guild_id")
 
-    if not guild:
+        if not guild_id:
+            return
+
+        guild = bot.get_guild(int(guild_id))
+
+        if not guild:
+            return
+
+        member = guild.get_member(int(user_id))
+
+        if member:
+            await process_tag_member(member, primary_guild=primary_guild)
+
         return
 
-    member = guild.get_member(int(user_id))
+    for guild in bot.guilds:
+        member = guild.get_member(int(user_id))
 
-    if member:
-        await process_tag_member(member, primary_guild=primary_guild)
+        if member:
+            await process_tag_member(member, primary_guild=primary_guild)
 
 
 @tasks.loop(minutes=5)
@@ -1140,7 +1241,15 @@ async def tag_scan():
             continue
 
         for member in guild.members:
-            await process_tag_member(member)
+            if member.bot:
+                continue
+
+            try:
+                user = await bot.fetch_user(member.id)
+            except:
+                user = member
+
+            await process_tag_member(member, user)
 
 @bot.event
 async def on_ready():
