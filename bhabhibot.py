@@ -557,6 +557,45 @@ def direct_sticker_file(data, content_type, url):
     return None
 
 
+def sticker_format_extension(sticker):
+    sticker_format = getattr(sticker, "format", None)
+    extension = getattr(sticker_format, "file_extension", None)
+
+    if extension:
+        return extension
+
+    name = str(sticker_format).lower()
+
+    if "lottie" in name:
+        return "json"
+
+    if "apng" in name:
+        return "png"
+
+    if "gif" in name:
+        return "gif"
+
+    return "png"
+
+
+def sticker_candidate_urls(sticker):
+    sticker_id = getattr(sticker, "id", None)
+    url = getattr(sticker, "url", None)
+    candidates = []
+
+    if url:
+        candidates.append(str(url))
+
+    if sticker_id:
+        extension = sticker_format_extension(sticker)
+        candidates.append(f"https://cdn.discordapp.com/stickers/{sticker_id}.{extension}")
+
+        if extension != "png":
+            candidates.append(f"https://cdn.discordapp.com/stickers/{sticker_id}.png")
+
+    return candidates
+
+
 async def find_sticker_source(ctx, value):
     value = value or ""
     url_match = URL_RE.search(value)
@@ -592,7 +631,10 @@ async def find_sticker_source(ctx, value):
 
         if stickers:
             sticker = stickers[0]
-            return sticker.url, clean_sticker_name(value or sticker.name), "sticker"
+            urls = sticker_candidate_urls(sticker)
+
+            if urls:
+                return urls[0], clean_sticker_name(value or sticker.name), "sticker"
 
         embed = embeds[0] if embeds else None
 
@@ -604,6 +646,45 @@ async def find_sticker_source(ctx, value):
                 return embed.thumbnail.url, clean_sticker_name(value or "sticker"), "embed"
 
     return None, clean_sticker_name(value), None
+
+
+async def find_replied_sticker(ctx):
+    if not ctx.message.reference:
+        return None
+
+    replied = ctx.message.reference.resolved
+
+    if not replied and ctx.message.reference.message_id:
+        try:
+            replied = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+        except:
+            return None
+
+    stickers = getattr(replied, "stickers", []) if replied else []
+    return stickers[0] if stickers else None
+
+
+async def direct_clone_replied_sticker(ctx, sticker, sticker_name):
+    for url in sticker_candidate_urls(sticker):
+        data, content_type = await download_media(url)
+
+        if not data:
+            continue
+
+        direct_file = direct_sticker_file(data, content_type, url)
+
+        if direct_file:
+            return direct_file
+
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(image_to_sticker, data),
+                timeout=8
+            )
+        except:
+            continue
+
+    return None
 
 
 class StaticFallbackView(discord.ui.View):
@@ -659,7 +740,11 @@ async def sticker_add(ctx, *, value=None):
     if not can_manage_expressions(ctx.guild.me):
         return await ctx.reply(embed=bot_missing_perm_embed(ctx, "manage_expressions"), mention_author=False)
 
+    replied_sticker = await find_replied_sticker(ctx)
     url, sticker_name, source_type = await find_sticker_source(ctx, value)
+
+    if replied_sticker and not value:
+        sticker_name = clean_sticker_name(getattr(replied_sticker, "name", None))
 
     if not url:
         return await ctx.reply(
@@ -668,12 +753,22 @@ async def sticker_add(ctx, *, value=None):
         )
 
     async with ctx.typing():
-        data, content_type = await download_media(url)
+        direct_file = None
 
-        if not data:
-            return await ctx.reply(embed=warning_embed(ctx, "Could not grab that media."), mention_author=False)
+        if replied_sticker:
+            direct_file = await direct_clone_replied_sticker(ctx, replied_sticker, sticker_name)
 
-        direct_file = direct_sticker_file(data, content_type, url) if source_type == "sticker" else None
+        data = None
+        content_type = ""
+
+        if not direct_file:
+            data, content_type = await download_media(url)
+
+            if not data:
+                return await ctx.reply(embed=warning_embed(ctx, "Could not grab that media."), mention_author=False)
+
+        if not direct_file and source_type == "sticker":
+            direct_file = direct_sticker_file(data, content_type, url)
 
         if direct_file:
             sticker_file, file_name, degraded = direct_file
