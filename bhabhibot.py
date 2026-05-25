@@ -396,22 +396,59 @@ def static_image_to_sticker(image):
 
 def animated_image_to_sticker(image):
     durations = []
-    source_frames = []
+    original_frames = []
+    total_frames = getattr(image, "n_frames", 1)
 
     for frame in ImageSequence.Iterator(image):
         duration = max(20, frame.info.get("duration", image.info.get("duration", 80)))
-
-        source_frames.append(frame.convert("RGBA").copy())
+        original_frames.append(frame.convert("RGBA").copy())
         durations.append(duration)
 
-    if not source_frames:
+    if not original_frames:
         return static_image_to_sticker(image)
 
-    try:
-        return frames_to_apng(source_frames, durations)
-    except:
-        sticker_file, file_name, _ = static_image_to_sticker(source_frames[0])
-        return sticker_file, file_name, True
+    frame_counts = [min(total_frames, 36), 30, 24, 18, 12, 8, 5]
+    sizes = [320, 288, 256, 224, 192, 160]
+
+    for colors in [128, 96, 64, 48, 32]:
+        for max_frames in frame_counts:
+            if max_frames > len(original_frames):
+                continue
+
+            for size in sizes:
+                selected, selected_durations = selected_frames_and_durations(
+                    original_frames,
+                    durations,
+                    max_frames,
+                    size
+                )
+
+                try:
+                    output_frames = [
+                        frame.convert("RGB").quantize(colors=colors)
+                        for frame in selected
+                    ]
+
+                    output = BytesIO()
+                    output_frames[0].save(
+                        output,
+                        format="GIF",
+                        save_all=True,
+                        append_images=output_frames[1:],
+                        optimize=True,
+                        duration=selected_durations,
+                        loop=0,
+                        disposal=2
+                    )
+
+                    if output.tell() <= MAX_STICKER_BYTES:
+                        output.seek(0)
+                        return output, "sticker.gif", False
+                except:
+                    continue
+
+    sticker_file, file_name, _ = static_image_to_sticker(original_frames[0])
+    return sticker_file, file_name, True
 
 
 def select_even_indices(length, count):
@@ -720,9 +757,16 @@ async def direct_clone_replied_sticker(ctx, sticker, sticker_name):
             logger.info("sticker_direct_clone_direct_success url=%s content_type=%s bytes=%s filename=%s", url, content_type, len(data), direct_file[1])
             return direct_file
 
-        filename = filename_for_sticker_asset(sticker, url, content_type)
-        logger.info("sticker_direct_clone_raw_attempt url=%s content_type=%s bytes=%s filename=%s", url, content_type, len(data), filename)
-        return raw_sticker_file(data, sticker, url, content_type)
+        try:
+            converted = await asyncio.wait_for(
+                asyncio.to_thread(image_to_sticker, data),
+                timeout=18
+            )
+            logger.info("sticker_direct_clone_convert_success url=%s content_type=%s bytes=%s filename=%s degraded=%s", url, content_type, len(data), converted[1], converted[2])
+            return converted
+        except Exception as exc:
+            logger.exception("sticker_direct_clone_convert_failed url=%s content_type=%s bytes=%s error=%r", url, content_type, len(data), exc)
+            continue
 
     logger.warning("sticker_direct_clone_failed sticker_id=%s sticker_name=%s", getattr(sticker, "id", None), getattr(sticker, "name", None))
     return None
