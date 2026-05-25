@@ -564,6 +564,10 @@ def direct_sticker_file(data, content_type, url):
     return None
 
 
+def raw_sticker_file(data, sticker, url, content_type):
+    return BytesIO(data), filename_for_sticker_asset(sticker, url, content_type), False
+
+
 def filename_for_sticker_asset(sticker, url, content_type):
     lowered_type = (content_type or "").lower()
     lowered_url = (url or "").lower().split("?")[0]
@@ -716,21 +720,9 @@ async def direct_clone_replied_sticker(ctx, sticker, sticker_name):
             logger.info("sticker_direct_clone_direct_success url=%s content_type=%s bytes=%s filename=%s", url, content_type, len(data), direct_file[1])
             return direct_file
 
-        if len(data) <= MAX_STICKER_BYTES:
-            filename = filename_for_sticker_asset(sticker, url, content_type)
-            logger.info("sticker_direct_clone_raw_success url=%s content_type=%s bytes=%s filename=%s", url, content_type, len(data), filename)
-            return BytesIO(data), filename, False
-
-        try:
-            converted = await asyncio.wait_for(
-                asyncio.to_thread(image_to_sticker, data),
-                timeout=8
-            )
-            logger.info("sticker_direct_clone_convert_success url=%s content_type=%s bytes=%s filename=%s degraded=%s", url, content_type, len(data), converted[1], converted[2])
-            return converted
-        except Exception as exc:
-            logger.exception("sticker_direct_clone_convert_failed url=%s content_type=%s bytes=%s error=%r", url, content_type, len(data), exc)
-            continue
+        filename = filename_for_sticker_asset(sticker, url, content_type)
+        logger.info("sticker_direct_clone_raw_attempt url=%s content_type=%s bytes=%s filename=%s", url, content_type, len(data), filename)
+        return raw_sticker_file(data, sticker, url, content_type)
 
     logger.warning("sticker_direct_clone_failed sticker_id=%s sticker_name=%s", getattr(sticker, "id", None), getattr(sticker, "name", None))
     return None
