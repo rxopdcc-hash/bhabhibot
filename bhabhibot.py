@@ -7,7 +7,7 @@ import os
 import re
 from datetime import timedelta
 from io import BytesIO
-from PIL import Image, ImageSequence
+from PIL import Image, ImageFilter, ImageSequence
 
 TOKEN = os.getenv("TOKEN")
 PREFIX = "."
@@ -331,9 +331,42 @@ def cover_square(image, size=320):
     return image.crop((left, top, left + size, top + size))
 
 
+def contain_square(image, size=320):
+    image = image.convert("RGBA")
+    width, height = image.size
+
+    if width == 0 or height == 0:
+        return Image.new("RGBA", (size, size), (0, 0, 0, 0))
+
+    background = cover_square(image, size).filter(ImageFilter.GaussianBlur(16))
+    background = background.point(lambda value: int(value * 0.62))
+
+    foreground = image.copy()
+    foreground.thumbnail((size, size), Image.LANCZOS)
+
+    x = (size - foreground.width) // 2
+    y = (size - foreground.height) // 2
+    background.alpha_composite(foreground, (x, y))
+    return background
+
+
+def smart_square(image, size=320):
+    width, height = image.size
+
+    if width == 0 or height == 0:
+        return Image.new("RGBA", (size, size), (0, 0, 0, 0))
+
+    ratio = max(width / height, height / width)
+
+    if ratio > 1.35:
+        return contain_square(image, size)
+
+    return cover_square(image, size)
+
+
 def static_image_to_sticker(image):
     for size in [320, 288, 256, 224, 192, 160, 128]:
-        canvas = cover_square(image, size)
+        canvas = smart_square(image, size)
 
         output = BytesIO()
         canvas.save(output, format="PNG", optimize=True)
@@ -352,35 +385,35 @@ def animated_image_to_sticker(image):
     durations = []
     frames = []
     total_frames = getattr(image, "n_frames", 1)
-    step = max(1, total_frames // 30)
+    step = max(1, total_frames // 24)
 
     for index, frame in enumerate(ImageSequence.Iterator(image)):
         if index % step != 0:
             continue
 
         duration = frame.info.get("duration", image.info.get("duration", 80))
-        canvas = cover_square(frame)
+        canvas = smart_square(frame)
 
-        frames.append(canvas.convert("P", palette=Image.ADAPTIVE, colors=128))
+        frames.append(canvas)
         durations.append(duration)
 
     if not frames:
         return static_image_to_sticker(image)
 
-    for colors in [128, 96, 64, 48, 32]:
-        for max_frames in [len(frames), 24, 18, 12, 8, 5]:
+    for colors in [96, 64, 48, 32]:
+        for max_frames in [min(len(frames), 24), 18, 12, 8, 5]:
             selected = frames[:max_frames]
             selected_durations = durations[:max_frames]
 
             output_frames = [
-                frame.convert("RGB").quantize(colors=colors)
+                frame.convert("RGB").quantize(colors=colors).convert("RGBA")
                 for frame in selected
             ]
 
             output = BytesIO()
             output_frames[0].save(
                 output,
-                format="GIF",
+                format="PNG",
                 save_all=True,
                 append_images=output_frames[1:],
                 optimize=True,
@@ -391,7 +424,7 @@ def animated_image_to_sticker(image):
 
             if output.tell() <= MAX_STICKER_BYTES:
                 output.seek(0)
-                return output, "sticker.gif"
+                return output, "sticker.png"
 
     return static_image_to_sticker(image)
 
