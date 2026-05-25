@@ -5,8 +5,10 @@ import asyncio
 import json
 import os
 import re
+import tempfile
 from datetime import timedelta
 from io import BytesIO
+import imageio.v2 as imageio
 from PIL import Image, ImageFilter, ImageSequence
 
 TOKEN = os.getenv("TOKEN")
@@ -315,6 +317,15 @@ def image_to_sticker(data):
     return static_image_to_sticker(image)
 
 
+def is_video_media(url, content_type):
+    lowered_url = (url or "").lower().split("?")[0]
+    lowered_type = (content_type or "").lower()
+    return (
+        lowered_type.startswith("video/") or
+        lowered_url.endswith((".mp4", ".webm", ".mov", ".m4v"))
+    )
+
+
 def cover_square(image, size=320):
     image = image.convert("RGBA")
     width, height = image.size
@@ -385,12 +396,8 @@ def animated_image_to_sticker(image):
     durations = []
     frames = []
     total_frames = getattr(image, "n_frames", 1)
-    step = max(1, total_frames // 24)
 
     for index, frame in enumerate(ImageSequence.Iterator(image)):
-        if index % step != 0:
-            continue
-
         duration = frame.info.get("duration", image.info.get("duration", 80))
         canvas = smart_square(frame)
 
@@ -400,10 +407,78 @@ def animated_image_to_sticker(image):
     if not frames:
         return static_image_to_sticker(image)
 
-    for colors in [96, 64, 48, 32]:
-        for max_frames in [min(len(frames), 24), 18, 12, 8, 5]:
-            selected = frames[:max_frames]
-            selected_durations = durations[:max_frames]
+    return frames_to_apng(frames, durations)
+
+
+def select_evenly(items, count):
+    if len(items) <= count:
+        return items
+
+    if count <= 1:
+        return [items[0]]
+
+    last = len(items) - 1
+    return [items[round(index * last / (count - 1))] for index in range(count)]
+
+
+def even_durations(durations, count):
+    if len(durations) <= count:
+        return durations
+
+    total = sum(durations) or count * 80
+    return [max(40, round(total / count)) for _ in range(count)]
+
+
+def video_to_sticker(data):
+    frames = []
+    durations = []
+    temp_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp:
+            temp.write(data)
+            temp_path = temp.name
+
+        reader = imageio.get_reader(temp_path)
+
+        try:
+            meta = reader.get_meta_data()
+        except:
+            meta = {}
+
+        fps = meta.get("fps") or 12
+        sample_step = max(1, round(fps / 10))
+        duration_ms = max(50, round(1000 * sample_step / fps))
+
+        for index, frame in enumerate(reader):
+            if index % sample_step != 0:
+                continue
+
+            frames.append(smart_square(Image.fromarray(frame)))
+            durations.append(duration_ms)
+
+            if len(frames) >= 18:
+                break
+
+        reader.close()
+    finally:
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except:
+                pass
+
+    if not frames:
+        raise ValueError("No video frames found")
+
+    return frames_to_apng(frames, durations)
+
+
+def frames_to_apng(frames, durations):
+    for colors in [96, 64, 48, 32, 24, 16]:
+        for max_frames in [min(len(frames), 18), 14, 10, 7, 5, 3]:
+            selected = select_evenly(frames, max_frames)
+            selected_durations = even_durations(durations, len(selected))
 
             output_frames = [
                 frame.convert("RGB").quantize(colors=colors).convert("RGBA")
@@ -426,7 +501,7 @@ def animated_image_to_sticker(image):
                 output.seek(0)
                 return output, "sticker.png"
 
-    return static_image_to_sticker(image)
+    return static_image_to_sticker(frames[0])
 
 
 async def download_media(url):
@@ -528,9 +603,14 @@ async def sticker_add(ctx, *, value=None):
         if "json" in content_type.lower() and len(data) <= MAX_STICKER_BYTES:
             sticker_file = BytesIO(data)
             file_name = "sticker.json"
+        elif is_video_media(url, content_type):
+            try:
+                sticker_file, file_name = await asyncio.to_thread(video_to_sticker, data)
+            except:
+                return await ctx.reply(embed=warning_embed(ctx, "That video could not be turned into a sticker."), mention_author=False)
         else:
             try:
-                sticker_file, file_name = image_to_sticker(data)
+                sticker_file, file_name = await asyncio.to_thread(image_to_sticker, data)
             except:
                 return await ctx.reply(embed=warning_embed(ctx, "That media could not be turned into a sticker."), mention_author=False)
 
@@ -1214,6 +1294,7 @@ async def tag_sync(ctx):
                 had_role = role in member.roles
 
             await process_tag_member(member, user)
+            await asyncio.sleep(0.25)
 
             if role and not had_role and role in member.roles:
                 updated += 1
@@ -1546,7 +1627,7 @@ def seed_rep_states():
                 REP_STATES[(guild.id, member.id, role.id)] = role in member.roles
 
 
-@tasks.loop(minutes=5)
+@tasks.loop(minutes=30)
 async def tag_scan():
     for guild in bot.guilds:
         gid = setup_guild(guild.id)
@@ -1555,15 +1636,8 @@ async def tag_scan():
             continue
 
         for member in guild.members:
-            if member.bot:
-                continue
-
-            try:
-                user = await bot.fetch_user(member.id)
-            except:
-                user = member
-
-            await process_tag_member(member, user)
+            if not member.bot:
+                await process_tag_member(member)
 
 @bot.event
 async def on_ready():
