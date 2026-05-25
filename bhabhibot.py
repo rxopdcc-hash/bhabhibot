@@ -3,6 +3,7 @@ from discord.ext import commands, tasks
 import aiohttp
 import asyncio
 import json
+import logging
 import os
 import re
 import tempfile
@@ -17,6 +18,7 @@ DATA_FILE = "/app/data/triggers.json"
 
 DEFAULT_COLOR = 0x2B2D42
 ERROR_COLOR = 0xFEE75C
+logger = logging.getLogger("bhabhibot")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -531,10 +533,12 @@ async def download_media(url):
     async with aiohttp.ClientSession() as session:
         async with session.get(url, timeout=20) as response:
             if response.status >= 400:
+                logger.warning("sticker_download_failed status=%s url=%s", response.status, url)
                 return None, None
 
             data = await response.read()
             content_type = response.headers.get("Content-Type", "")
+            logger.info("sticker_download_ok status=%s bytes=%s content_type=%s url=%s", response.status, len(data), content_type, url)
             return data, content_type
 
 
@@ -691,28 +695,44 @@ async def find_replied_sticker(ctx):
 
 
 async def direct_clone_replied_sticker(ctx, sticker, sticker_name):
+    logger.info(
+        "sticker_direct_clone_start sticker_id=%s sticker_name=%s sticker_format=%s candidate_urls=%s",
+        getattr(sticker, "id", None),
+        getattr(sticker, "name", None),
+        getattr(sticker, "format", None),
+        sticker_candidate_urls(sticker)
+    )
+
     for url in sticker_candidate_urls(sticker):
         data, content_type = await download_media(url)
 
         if not data:
+            logger.warning("sticker_direct_clone_no_data url=%s", url)
             continue
 
         direct_file = direct_sticker_file(data, content_type, url)
 
         if direct_file:
+            logger.info("sticker_direct_clone_direct_success url=%s content_type=%s bytes=%s filename=%s", url, content_type, len(data), direct_file[1])
             return direct_file
 
         if len(data) <= MAX_STICKER_BYTES:
-            return BytesIO(data), filename_for_sticker_asset(sticker, url, content_type), False
+            filename = filename_for_sticker_asset(sticker, url, content_type)
+            logger.info("sticker_direct_clone_raw_success url=%s content_type=%s bytes=%s filename=%s", url, content_type, len(data), filename)
+            return BytesIO(data), filename, False
 
         try:
-            return await asyncio.wait_for(
+            converted = await asyncio.wait_for(
                 asyncio.to_thread(image_to_sticker, data),
                 timeout=8
             )
-        except:
+            logger.info("sticker_direct_clone_convert_success url=%s content_type=%s bytes=%s filename=%s degraded=%s", url, content_type, len(data), converted[1], converted[2])
+            return converted
+        except Exception as exc:
+            logger.exception("sticker_direct_clone_convert_failed url=%s content_type=%s bytes=%s error=%r", url, content_type, len(data), exc)
             continue
 
+    logger.warning("sticker_direct_clone_failed sticker_id=%s sticker_name=%s", getattr(sticker, "id", None), getattr(sticker, "name", None))
     return None
 
 
@@ -772,6 +792,18 @@ async def sticker_add(ctx, *, value=None):
     replied_sticker = await find_replied_sticker(ctx)
     url, sticker_name, source_type = await find_sticker_source(ctx, value)
 
+    logger.info(
+        "sticker_add_start guild_id=%s user_id=%s source_type=%s url=%s name=%s replied_sticker_id=%s replied_sticker_format=%s value=%r",
+        ctx.guild.id,
+        ctx.author.id,
+        source_type,
+        url,
+        sticker_name,
+        getattr(replied_sticker, "id", None),
+        getattr(replied_sticker, "format", None),
+        value
+    )
+
     if replied_sticker and not value:
         sticker_name = clean_sticker_name(getattr(replied_sticker, "name", None))
 
@@ -804,17 +836,21 @@ async def sticker_add(ctx, *, value=None):
 
         if direct_file:
             sticker_file, file_name, degraded = direct_file
+            logger.info("sticker_add_using_direct_file filename=%s degraded=%s", file_name, degraded)
         elif "json" in content_type.lower() and len(data) <= MAX_STICKER_BYTES:
             sticker_file = BytesIO(data)
             file_name = "sticker.json"
             degraded = False
+            logger.info("sticker_add_using_json bytes=%s", len(data))
         elif is_video_media(url, content_type):
             try:
                 sticker_file, file_name, degraded = await asyncio.wait_for(
                     asyncio.to_thread(video_to_sticker, data),
                     timeout=18
                 )
-            except:
+                logger.info("sticker_add_video_converted filename=%s degraded=%s", file_name, degraded)
+            except Exception as exc:
+                logger.exception("sticker_add_video_failed content_type=%s bytes=%s url=%s error=%r", content_type, len(data) if data else None, url, exc)
                 return await ctx.reply(embed=warning_embed(ctx, "That video could not be turned into a sticker."), mention_author=False)
         else:
             try:
@@ -822,7 +858,9 @@ async def sticker_add(ctx, *, value=None):
                     asyncio.to_thread(image_to_sticker, data),
                     timeout=18
                 )
-            except:
+                logger.info("sticker_add_media_converted filename=%s degraded=%s content_type=%s bytes=%s", file_name, degraded, content_type, len(data) if data else None)
+            except Exception as exc:
+                logger.exception("sticker_add_media_failed content_type=%s bytes=%s url=%s error=%r", content_type, len(data) if data else None, url, exc)
                 return await ctx.reply(embed=warning_embed(ctx, "That media could not be turned into a sticker."), mention_author=False)
 
         if degraded:
@@ -857,9 +895,12 @@ async def sticker_add(ctx, *, value=None):
                 file=discord.File(sticker_file, filename=file_name),
                 reason=f"{ctx.author} used sticker add"
             )
-        except discord.HTTPException:
+            logger.info("sticker_create_success sticker_id=%s sticker_name=%s filename=%s degraded=%s", created.id, created.name, file_name, degraded)
+        except discord.HTTPException as exc:
+            logger.exception("sticker_create_http_failed status=%s code=%s text=%s filename=%s degraded=%s", getattr(exc, "status", None), getattr(exc, "code", None), getattr(exc, "text", None), file_name, degraded)
             return await ctx.reply(embed=warning_embed(ctx, "Discord rejected that sticker after conversion."), mention_author=False)
-        except discord.Forbidden:
+        except discord.Forbidden as exc:
+            logger.exception("sticker_create_forbidden error=%r", exc)
             return await ctx.reply(embed=bot_missing_perm_embed(ctx, "manage_expressions"), mention_author=False)
 
     await ctx.reply(
