@@ -551,10 +551,34 @@ def direct_sticker_file(data, content_type, url):
     if "gif" in lowered_type or lowered_url.endswith(".gif"):
         return BytesIO(data), "sticker.gif", False
 
-    if "png" in lowered_type or lowered_url.endswith(".png"):
+    if "png" in lowered_type or lowered_url.endswith(".png") or "apng" in lowered_type:
         return BytesIO(data), "sticker.png", False
 
+    if "webp" in lowered_type or lowered_url.endswith(".webp"):
+        return None
+
     return None
+
+
+def filename_for_sticker_asset(sticker, url, content_type):
+    lowered_type = (content_type or "").lower()
+    lowered_url = (url or "").lower().split("?")[0]
+
+    if "json" in lowered_type or lowered_url.endswith(".json"):
+        return "sticker.json"
+
+    if "gif" in lowered_type or lowered_url.endswith(".gif"):
+        return "sticker.gif"
+
+    if "png" in lowered_type or "apng" in lowered_type or lowered_url.endswith(".png"):
+        return "sticker.png"
+
+    extension = sticker_format_extension(sticker)
+
+    if extension in ("json", "gif", "png"):
+        return f"sticker.{extension}"
+
+    return "sticker.png"
 
 
 def sticker_format_extension(sticker):
@@ -636,6 +660,8 @@ async def find_sticker_source(ctx, value):
             if urls:
                 return urls[0], clean_sticker_name(value or sticker.name), "sticker"
 
+            return None, clean_sticker_name(value or sticker.name), "sticker"
+
         embed = embeds[0] if embeds else None
 
         if embed:
@@ -675,6 +701,9 @@ async def direct_clone_replied_sticker(ctx, sticker, sticker_name):
 
         if direct_file:
             return direct_file
+
+        if len(data) <= MAX_STICKER_BYTES:
+            return BytesIO(data), filename_for_sticker_asset(sticker, url, content_type), False
 
         try:
             return await asyncio.wait_for(
@@ -746,7 +775,7 @@ async def sticker_add(ctx, *, value=None):
     if replied_sticker and not value:
         sticker_name = clean_sticker_name(getattr(replied_sticker, "name", None))
 
-    if not url:
+    if not url and not replied_sticker:
         return await ctx.reply(
             embed=warning_embed(ctx, "Reply to media, attach media, or drop a media link with `.sticker add`."),
             mention_author=False
@@ -761,11 +790,14 @@ async def sticker_add(ctx, *, value=None):
         data = None
         content_type = ""
 
-        if not direct_file:
+        if not direct_file and url:
             data, content_type = await download_media(url)
 
             if not data:
                 return await ctx.reply(embed=warning_embed(ctx, "Could not grab that media."), mention_author=False)
+
+        if not direct_file and not data:
+            return await ctx.reply(embed=warning_embed(ctx, "Could not grab that sticker."), mention_author=False)
 
         if not direct_file and source_type == "sticker":
             direct_file = direct_sticker_file(data, content_type, url)
