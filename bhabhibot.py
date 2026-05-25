@@ -315,17 +315,25 @@ def image_to_sticker(data):
     return static_image_to_sticker(image)
 
 
-def static_image_to_sticker(image):
+def cover_square(image, size=320):
     image = image.convert("RGBA")
+    width, height = image.size
 
+    if width == 0 or height == 0:
+        return Image.new("RGBA", (size, size), (0, 0, 0, 0))
+
+    scale = max(size / width, size / height)
+    new_size = (max(size, round(width * scale)), max(size, round(height * scale)))
+    image = image.resize(new_size, Image.LANCZOS)
+
+    left = (image.width - size) // 2
+    top = (image.height - size) // 2
+    return image.crop((left, top, left + size, top + size))
+
+
+def static_image_to_sticker(image):
     for size in [320, 288, 256, 224, 192, 160, 128]:
-        frame = image.copy()
-        frame.thumbnail((size, size), Image.LANCZOS)
-
-        canvas = Image.new("RGBA", (320, 320), (0, 0, 0, 0))
-        x = (320 - frame.width) // 2
-        y = (320 - frame.height) // 2
-        canvas.alpha_composite(frame, (x, y))
+        canvas = cover_square(image, size)
 
         output = BytesIO()
         canvas.save(output, format="PNG", optimize=True)
@@ -351,13 +359,7 @@ def animated_image_to_sticker(image):
             continue
 
         duration = frame.info.get("duration", image.info.get("duration", 80))
-        prepared = frame.convert("RGBA")
-        prepared.thumbnail((320, 320), Image.LANCZOS)
-
-        canvas = Image.new("RGBA", (320, 320), (0, 0, 0, 0))
-        x = (320 - prepared.width) // 2
-        y = (320 - prepared.height) // 2
-        canvas.alpha_composite(prepared, (x, y))
+        canvas = cover_square(frame)
 
         frames.append(canvas.convert("P", palette=Image.ADAPTIVE, colors=128))
         durations.append(duration)
