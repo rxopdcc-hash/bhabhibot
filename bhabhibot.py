@@ -384,12 +384,12 @@ def static_image_to_sticker(image):
 
         if output.tell() <= MAX_STICKER_BYTES:
             output.seek(0)
-            return output, "sticker.png"
+            return output, "sticker.png", False
 
     output = BytesIO()
     canvas.convert("P", palette=Image.ADAPTIVE, colors=128).save(output, format="PNG", optimize=True)
     output.seek(0)
-    return output, "sticker.png"
+    return output, "sticker.png", False
 
 
 def animated_image_to_sticker(image):
@@ -399,18 +399,22 @@ def animated_image_to_sticker(image):
     for frame in ImageSequence.Iterator(image):
         duration = max(20, frame.info.get("duration", image.info.get("duration", 80)))
 
-        source_frames.append(frame.copy())
+        source_frames.append(frame.convert("RGBA").copy())
         durations.append(duration)
 
     if not source_frames:
         return static_image_to_sticker(image)
 
-    return frames_to_apng(source_frames, durations)
+    try:
+        return frames_to_apng(source_frames, durations)
+    except:
+        sticker_file, file_name, _ = static_image_to_sticker(source_frames[0])
+        return sticker_file, file_name, True
 
 
 def select_even_indices(length, count):
     if length <= count:
-        return list(range(length))
+        return [index for index in range(length)]
 
     if count <= 1:
         return [0]
@@ -476,12 +480,16 @@ def video_to_sticker(data):
     if not frames:
         raise ValueError("No video frames found")
 
-    return frames_to_apng(frames, durations)
+    try:
+        return frames_to_apng(frames, durations)
+    except:
+        sticker_file, file_name, _ = static_image_to_sticker(frames[0])
+        return sticker_file, file_name, True
 
 
 def frames_to_apng(frames, durations):
-    frame_counts = [min(len(frames), 48), 40, 32, 24, 18, 14, 10, 7, 5, 3]
-    sizes = [320, 288, 256, 224, 192, 160]
+    frame_counts = [min(len(frames), 32), 24, 18, 12, 8, 5, 3]
+    sizes = [320, 256, 192, 160]
 
     for max_frames in frame_counts:
         if max_frames > len(frames):
@@ -490,29 +498,33 @@ def frames_to_apng(frames, durations):
         for size in sizes:
             selected, selected_durations = selected_frames_and_durations(frames, durations, max_frames, size)
 
-            for colors in [128, 96, 64, 48, 32, 24, 16]:
-                output_frames = [
-                    frame.convert("RGB").quantize(colors=colors).convert("RGBA")
-                    for frame in selected
-                ]
+            for colors in [96, 64, 48, 32, 16]:
+                try:
+                    output_frames = [
+                        frame.convert("RGB").quantize(colors=colors).convert("RGBA")
+                        for frame in selected
+                    ]
 
-                output = BytesIO()
-                output_frames[0].save(
-                    output,
-                    format="PNG",
-                    save_all=True,
-                    append_images=output_frames[1:],
-                    optimize=True,
-                    duration=selected_durations,
-                    loop=0,
-                    disposal=2
-                )
+                    output = BytesIO()
+                    output_frames[0].save(
+                        output,
+                        format="PNG",
+                        save_all=True,
+                        append_images=output_frames[1:],
+                        optimize=True,
+                        duration=selected_durations,
+                        loop=0,
+                        disposal=2
+                    )
+                except:
+                    continue
 
                 if output.tell() <= MAX_STICKER_BYTES:
                     output.seek(0)
-                    return output, "sticker.png"
+                    return output, "sticker.png", False
 
-    return static_image_to_sticker(frames[0])
+    sticker_file, file_name, _ = static_image_to_sticker(frames[0])
+    return sticker_file, file_name, True
 
 
 async def download_media(url):
@@ -526,6 +538,25 @@ async def download_media(url):
             return data, content_type
 
 
+def direct_sticker_file(data, content_type, url):
+    lowered_type = (content_type or "").lower()
+    lowered_url = (url or "").lower().split("?")[0]
+
+    if len(data) > MAX_STICKER_BYTES:
+        return None
+
+    if "json" in lowered_type or lowered_url.endswith(".json"):
+        return BytesIO(data), "sticker.json", False
+
+    if "gif" in lowered_type or lowered_url.endswith(".gif"):
+        return BytesIO(data), "sticker.gif", False
+
+    if "png" in lowered_type or lowered_url.endswith(".png"):
+        return BytesIO(data), "sticker.png", False
+
+    return None
+
+
 async def find_sticker_source(ctx, value):
     value = value or ""
     url_match = URL_RE.search(value)
@@ -533,11 +564,11 @@ async def find_sticker_source(ctx, value):
     if url_match:
         url = url_match.group(0).strip("<>")
         name = clean_sticker_name(value.replace(url_match.group(0), "").strip() or url)
-        return url, name
+        return url, name, "link"
 
     if ctx.message.attachments:
         attachment = ctx.message.attachments[0]
-        return attachment.url, clean_sticker_name(value or attachment.filename)
+        return attachment.url, clean_sticker_name(value or attachment.filename), "attachment"
 
     replied = None
 
@@ -557,22 +588,53 @@ async def find_sticker_source(ctx, value):
 
         if attachments:
             attachment = attachments[0]
-            return attachment.url, clean_sticker_name(value or attachment.filename)
+            return attachment.url, clean_sticker_name(value or attachment.filename), "attachment"
 
         if stickers:
             sticker = stickers[0]
-            return sticker.url, clean_sticker_name(value or sticker.name)
+            return sticker.url, clean_sticker_name(value or sticker.name), "sticker"
 
         embed = embeds[0] if embeds else None
 
         if embed:
             if embed.image and embed.image.url:
-                return embed.image.url, clean_sticker_name(value or "sticker")
+                return embed.image.url, clean_sticker_name(value or "sticker"), "embed"
 
             if embed.thumbnail and embed.thumbnail.url:
-                return embed.thumbnail.url, clean_sticker_name(value or "sticker")
+                return embed.thumbnail.url, clean_sticker_name(value or "sticker"), "embed"
 
-    return None, clean_sticker_name(value)
+    return None, clean_sticker_name(value), None
+
+
+class StaticFallbackView(discord.ui.View):
+    def __init__(self, author_id):
+        super().__init__(timeout=45)
+        self.author_id = author_id
+        self.confirmed = None
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("This sticker choice is not yours.", ephemeral=True)
+            return False
+
+        return True
+
+    async def stop_with_choice(self, interaction, confirmed):
+        self.confirmed = confirmed
+
+        for item in self.children:
+            item.disabled = True
+
+        await interaction.response.edit_message(view=self)
+        self.stop()
+
+    @discord.ui.button(label="Add static", style=discord.ButtonStyle.success)
+    async def add_static(self, interaction, button):
+        await self.stop_with_choice(interaction, True)
+
+    @discord.ui.button(label="Skip it", style=discord.ButtonStyle.secondary)
+    async def skip_it(self, interaction, button):
+        await self.stop_with_choice(interaction, False)
 
 
 @bot.group(invoke_without_command=True)
@@ -597,7 +659,7 @@ async def sticker_add(ctx, *, value=None):
     if not can_manage_expressions(ctx.guild.me):
         return await ctx.reply(embed=bot_missing_perm_embed(ctx, "manage_expressions"), mention_author=False)
 
-    url, sticker_name = await find_sticker_source(ctx, value)
+    url, sticker_name, source_type = await find_sticker_source(ctx, value)
 
     if not url:
         return await ctx.reply(
@@ -611,19 +673,54 @@ async def sticker_add(ctx, *, value=None):
         if not data:
             return await ctx.reply(embed=warning_embed(ctx, "Could not grab that media."), mention_author=False)
 
-        if "json" in content_type.lower() and len(data) <= MAX_STICKER_BYTES:
+        direct_file = direct_sticker_file(data, content_type, url) if source_type == "sticker" else None
+
+        if direct_file:
+            sticker_file, file_name, degraded = direct_file
+        elif "json" in content_type.lower() and len(data) <= MAX_STICKER_BYTES:
             sticker_file = BytesIO(data)
             file_name = "sticker.json"
+            degraded = False
         elif is_video_media(url, content_type):
             try:
-                sticker_file, file_name = await asyncio.to_thread(video_to_sticker, data)
+                sticker_file, file_name, degraded = await asyncio.wait_for(
+                    asyncio.to_thread(video_to_sticker, data),
+                    timeout=18
+                )
             except:
                 return await ctx.reply(embed=warning_embed(ctx, "That video could not be turned into a sticker."), mention_author=False)
         else:
             try:
-                sticker_file, file_name = await asyncio.to_thread(image_to_sticker, data)
+                sticker_file, file_name, degraded = await asyncio.wait_for(
+                    asyncio.to_thread(image_to_sticker, data),
+                    timeout=18
+                )
             except:
                 return await ctx.reply(embed=warning_embed(ctx, "That media could not be turned into a sticker."), mention_author=False)
+
+        if degraded:
+            view = StaticFallbackView(ctx.author.id)
+            prompt = await ctx.reply(
+                embed=warning_embed(
+                    ctx,
+                    "That animated media is too heavy/complex for a clean Discord sticker. I can add a static version instead."
+                ),
+                view=view,
+                mention_author=False
+            )
+
+            await view.wait()
+
+            if view.confirmed is not True:
+                for item in view.children:
+                    item.disabled = True
+
+                try:
+                    await prompt.edit(view=view)
+                except:
+                    pass
+
+                return
 
         try:
             created = await ctx.guild.create_sticker(
