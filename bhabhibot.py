@@ -1,10 +1,13 @@
 import discord
 from discord.ext import commands, tasks
+import aiohttp
 import asyncio
 import json
 import os
 import re
 from datetime import timedelta
+from io import BytesIO
+from PIL import Image, ImageSequence
 
 TOKEN = os.getenv("TOKEN")
 PREFIX = "."
@@ -21,8 +24,10 @@ intents.presences = True
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
 MENTION_RE = re.compile(r"<@!?(\d+)>")
+URL_RE = re.compile(r"https?://\S+")
 REP_STATES = {}
 REP_LOCKS = {}
+MAX_STICKER_BYTES = 512 * 1024
 
 DEFAULT_VANITY = {
     "enabled": False,
@@ -171,6 +176,14 @@ def warning_embed(ctx, msg):
     )
 
 
+def can_manage_expressions(member):
+    permissions = member.guild_permissions
+    return (
+        getattr(permissions, "manage_expressions", False) or
+        getattr(permissions, "manage_emojis_and_stickers", False)
+    )
+
+
 def parse_duration(raw):
     if not raw:
         return timedelta(minutes=10)
@@ -277,6 +290,230 @@ async def run_mute(ctx, member=None, duration="10m", *, reason="No reason provid
     await member.timeout(time, reason=f"{ctx.author} | {reason}")
     await ctx.reply(
         embed=premium_embed(ctx, "muted", f"**{member}** has been muted.\nDuration: `{duration}`\nReason: `{reason}`"),
+        mention_author=False
+    )
+
+
+def clean_sticker_name(raw):
+    raw = raw or "sticker"
+    name = os.path.splitext(os.path.basename(raw.split("?")[0]))[0]
+    name = re.sub(r"[^a-zA-Z0-9_]+", "_", name).strip("_").lower()
+
+    if len(name) < 2:
+        name = f"{name}_sticker" if name else "sticker"
+
+    return name[:30]
+
+
+def image_to_sticker(data):
+    image = Image.open(BytesIO(data))
+    is_animated = getattr(image, "is_animated", False)
+
+    if is_animated:
+        return animated_image_to_sticker(image)
+
+    return static_image_to_sticker(image)
+
+
+def static_image_to_sticker(image):
+    image = image.convert("RGBA")
+
+    for size in [320, 288, 256, 224, 192, 160, 128]:
+        frame = image.copy()
+        frame.thumbnail((size, size), Image.LANCZOS)
+
+        canvas = Image.new("RGBA", (320, 320), (0, 0, 0, 0))
+        x = (320 - frame.width) // 2
+        y = (320 - frame.height) // 2
+        canvas.alpha_composite(frame, (x, y))
+
+        output = BytesIO()
+        canvas.save(output, format="PNG", optimize=True)
+
+        if output.tell() <= MAX_STICKER_BYTES:
+            output.seek(0)
+            return output, "sticker.png"
+
+    output = BytesIO()
+    canvas.convert("P", palette=Image.ADAPTIVE, colors=128).save(output, format="PNG", optimize=True)
+    output.seek(0)
+    return output, "sticker.png"
+
+
+def animated_image_to_sticker(image):
+    durations = []
+    frames = []
+    total_frames = getattr(image, "n_frames", 1)
+    step = max(1, total_frames // 30)
+
+    for index, frame in enumerate(ImageSequence.Iterator(image)):
+        if index % step != 0:
+            continue
+
+        duration = frame.info.get("duration", image.info.get("duration", 80))
+        prepared = frame.convert("RGBA")
+        prepared.thumbnail((320, 320), Image.LANCZOS)
+
+        canvas = Image.new("RGBA", (320, 320), (0, 0, 0, 0))
+        x = (320 - prepared.width) // 2
+        y = (320 - prepared.height) // 2
+        canvas.alpha_composite(prepared, (x, y))
+
+        frames.append(canvas.convert("P", palette=Image.ADAPTIVE, colors=128))
+        durations.append(duration)
+
+    if not frames:
+        return static_image_to_sticker(image)
+
+    for colors in [128, 96, 64, 48, 32]:
+        for max_frames in [len(frames), 24, 18, 12, 8, 5]:
+            selected = frames[:max_frames]
+            selected_durations = durations[:max_frames]
+
+            output_frames = [
+                frame.convert("RGB").quantize(colors=colors)
+                for frame in selected
+            ]
+
+            output = BytesIO()
+            output_frames[0].save(
+                output,
+                format="GIF",
+                save_all=True,
+                append_images=output_frames[1:],
+                optimize=True,
+                duration=selected_durations,
+                loop=0,
+                disposal=2
+            )
+
+            if output.tell() <= MAX_STICKER_BYTES:
+                output.seek(0)
+                return output, "sticker.gif"
+
+    return static_image_to_sticker(image)
+
+
+async def download_media(url):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, timeout=20) as response:
+            if response.status >= 400:
+                return None, None
+
+            data = await response.read()
+            content_type = response.headers.get("Content-Type", "")
+            return data, content_type
+
+
+async def find_sticker_source(ctx, value):
+    value = value or ""
+    url_match = URL_RE.search(value)
+
+    if url_match:
+        url = url_match.group(0).strip("<>")
+        name = clean_sticker_name(value.replace(url_match.group(0), "").strip() or url)
+        return url, name
+
+    if ctx.message.attachments:
+        attachment = ctx.message.attachments[0]
+        return attachment.url, clean_sticker_name(value or attachment.filename)
+
+    replied = None
+
+    if ctx.message.reference:
+        replied = ctx.message.reference.resolved
+
+        if not replied and ctx.message.reference.message_id:
+            try:
+                replied = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+            except:
+                replied = None
+
+    if replied:
+        attachments = getattr(replied, "attachments", [])
+        stickers = getattr(replied, "stickers", [])
+        embeds = getattr(replied, "embeds", [])
+
+        if attachments:
+            attachment = attachments[0]
+            return attachment.url, clean_sticker_name(value or attachment.filename)
+
+        if stickers:
+            sticker = stickers[0]
+            return sticker.url, clean_sticker_name(value or sticker.name)
+
+        embed = embeds[0] if embeds else None
+
+        if embed:
+            if embed.image and embed.image.url:
+                return embed.image.url, clean_sticker_name(value or "sticker")
+
+            if embed.thumbnail and embed.thumbnail.url:
+                return embed.thumbnail.url, clean_sticker_name(value or "sticker")
+
+    return None, clean_sticker_name(value)
+
+
+@bot.group(invoke_without_command=True)
+async def sticker(ctx):
+    await ctx.reply(
+        embed=premium_embed(
+            ctx,
+            "sticker",
+            "Create a server sticker from replied media, attached media, or a link",
+            ".sticker add [name/link]",
+            ".sticker add jija"
+        ),
+        mention_author=False
+    )
+
+
+@sticker.command(name="add")
+async def sticker_add(ctx, *, value=None):
+    if not can_manage_expressions(ctx.author):
+        return await ctx.reply(embed=missing_perm_embed(ctx, "manage_expressions"), mention_author=False)
+
+    if not can_manage_expressions(ctx.guild.me):
+        return await ctx.reply(embed=bot_missing_perm_embed(ctx, "manage_expressions"), mention_author=False)
+
+    url, sticker_name = await find_sticker_source(ctx, value)
+
+    if not url:
+        return await ctx.reply(
+            embed=warning_embed(ctx, "Reply to media, attach media, or drop a media link with `.sticker add`."),
+            mention_author=False
+        )
+
+    async with ctx.typing():
+        data, content_type = await download_media(url)
+
+        if not data:
+            return await ctx.reply(embed=warning_embed(ctx, "Could not grab that media."), mention_author=False)
+
+        if "json" in content_type.lower() and len(data) <= MAX_STICKER_BYTES:
+            sticker_file = BytesIO(data)
+            file_name = "sticker.json"
+        else:
+            try:
+                sticker_file, file_name = image_to_sticker(data)
+            except:
+                return await ctx.reply(embed=warning_embed(ctx, "That media could not be turned into a sticker."), mention_author=False)
+
+        try:
+            created = await ctx.guild.create_sticker(
+                name=sticker_name,
+                description=f"Added by {ctx.author}",
+                emoji="\U0001f525",
+                file=discord.File(sticker_file, filename=file_name),
+                reason=f"{ctx.author} used sticker add"
+            )
+        except discord.HTTPException:
+            return await ctx.reply(embed=warning_embed(ctx, "Discord rejected that sticker after conversion."), mention_author=False)
+        except discord.Forbidden:
+            return await ctx.reply(embed=bot_missing_perm_embed(ctx, "manage_expressions"), mention_author=False)
+
+    await ctx.reply(
+        embed=premium_embed(ctx, "sticker added", f"Boom. **{created.name}** is in the sticker drawer now."),
         mention_author=False
     )
 
