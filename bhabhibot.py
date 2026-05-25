@@ -394,39 +394,44 @@ def static_image_to_sticker(image):
 
 def animated_image_to_sticker(image):
     durations = []
-    frames = []
-    total_frames = getattr(image, "n_frames", 1)
+    source_frames = []
 
-    for index, frame in enumerate(ImageSequence.Iterator(image)):
-        duration = frame.info.get("duration", image.info.get("duration", 80))
-        canvas = smart_square(frame)
+    for frame in ImageSequence.Iterator(image):
+        duration = max(20, frame.info.get("duration", image.info.get("duration", 80)))
 
-        frames.append(canvas)
+        source_frames.append(frame.copy())
         durations.append(duration)
 
-    if not frames:
+    if not source_frames:
         return static_image_to_sticker(image)
 
-    return frames_to_apng(frames, durations)
+    return frames_to_apng(source_frames, durations)
 
 
-def select_evenly(items, count):
-    if len(items) <= count:
-        return items
+def select_even_indices(length, count):
+    if length <= count:
+        return list(range(length))
 
     if count <= 1:
-        return [items[0]]
+        return [0]
 
-    last = len(items) - 1
-    return [items[round(index * last / (count - 1))] for index in range(count)]
+    last = length - 1
+    return sorted(set(round(index * last / (count - 1)) for index in range(count)))
 
 
-def even_durations(durations, count):
-    if len(durations) <= count:
-        return durations
+def selected_frames_and_durations(frames, durations, count, size):
+    indices = select_even_indices(len(frames), count)
+    selected_frames = []
+    selected_durations = []
 
-    total = sum(durations) or count * 80
-    return [max(40, round(total / count)) for _ in range(count)]
+    for position, frame_index in enumerate(indices):
+        next_index = indices[position + 1] if position + 1 < len(indices) else len(frames)
+        duration = sum(durations[frame_index:next_index])
+
+        selected_frames.append(smart_square(frames[frame_index], size))
+        selected_durations.append(max(20, duration))
+
+    return selected_frames, selected_durations
 
 
 def video_to_sticker(data):
@@ -447,17 +452,17 @@ def video_to_sticker(data):
             meta = {}
 
         fps = meta.get("fps") or 12
-        sample_step = max(1, round(fps / 10))
-        duration_ms = max(50, round(1000 * sample_step / fps))
+        sample_step = max(1, round(fps / 15))
+        duration_ms = max(35, round(1000 * sample_step / fps))
 
         for index, frame in enumerate(reader):
             if index % sample_step != 0:
                 continue
 
-            frames.append(smart_square(Image.fromarray(frame)))
+            frames.append(Image.fromarray(frame))
             durations.append(duration_ms)
 
-            if len(frames) >= 18:
+            if len(frames) >= 36:
                 break
 
         reader.close()
@@ -475,31 +480,37 @@ def video_to_sticker(data):
 
 
 def frames_to_apng(frames, durations):
-    for colors in [96, 64, 48, 32, 24, 16]:
-        for max_frames in [min(len(frames), 18), 14, 10, 7, 5, 3]:
-            selected = select_evenly(frames, max_frames)
-            selected_durations = even_durations(durations, len(selected))
+    frame_counts = [min(len(frames), 48), 40, 32, 24, 18, 14, 10, 7, 5, 3]
+    sizes = [320, 288, 256, 224, 192, 160]
 
-            output_frames = [
-                frame.convert("RGB").quantize(colors=colors).convert("RGBA")
-                for frame in selected
-            ]
+    for max_frames in frame_counts:
+        if max_frames > len(frames):
+            continue
 
-            output = BytesIO()
-            output_frames[0].save(
-                output,
-                format="PNG",
-                save_all=True,
-                append_images=output_frames[1:],
-                optimize=True,
-                duration=selected_durations,
-                loop=0,
-                disposal=2
-            )
+        for size in sizes:
+            selected, selected_durations = selected_frames_and_durations(frames, durations, max_frames, size)
 
-            if output.tell() <= MAX_STICKER_BYTES:
-                output.seek(0)
-                return output, "sticker.png"
+            for colors in [128, 96, 64, 48, 32, 24, 16]:
+                output_frames = [
+                    frame.convert("RGB").quantize(colors=colors).convert("RGBA")
+                    for frame in selected
+                ]
+
+                output = BytesIO()
+                output_frames[0].save(
+                    output,
+                    format="PNG",
+                    save_all=True,
+                    append_images=output_frames[1:],
+                    optimize=True,
+                    duration=selected_durations,
+                    loop=0,
+                    disposal=2
+                )
+
+                if output.tell() <= MAX_STICKER_BYTES:
+                    output.seek(0)
+                    return output, "sticker.png"
 
     return static_image_to_sticker(frames[0])
 
