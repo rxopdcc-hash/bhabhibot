@@ -14,7 +14,7 @@ from PIL import Image, ImageFilter, ImageSequence
 
 TOKEN = os.getenv("TOKEN")
 PREFIX = "."
-DATA_FILE = "/app/data/triggers.json"
+DATA_FILE = os.getenv("DATA_FILE", "/app/data/triggers.json")
 
 DEFAULT_COLOR = 0x2B2D42
 ERROR_COLOR = 0xFEE75C
@@ -96,6 +96,10 @@ TRIGGERS = load_data()
 
 
 def save_data():
+    data_dir = os.path.dirname(DATA_FILE)
+    if data_dir:
+        os.makedirs(data_dir, exist_ok=True)
+
     with open(DATA_FILE, "w") as f:
         json.dump(TRIGGERS, f, indent=4)
 
